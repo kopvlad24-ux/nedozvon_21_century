@@ -10,8 +10,8 @@ const PORT = process.env.PORT || 3000;
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const AMO_DOMAIN = process.env.AMO_DOMAIN; // например: yourcompany.amocrm.ru
 const AMO_TOKEN = process.env.AMO_TOKEN;   // долгосрочный токен
-const PIPELINE_NAME = 'Новостройки 2.0';
-const STAGE_NAME = 'Недозвон';
+const PIPELINE_NAME = 'НОВОСТРОЙКИ 2.0';
+const STAGE_NAME = '~ НЕ ДОЗВОНИЛСЯ';
 const GROUP_NAME = 'Клуб чемпионов';
 
 // ─── AMO API HELPER ───────────────────────────────────────────────────────────
