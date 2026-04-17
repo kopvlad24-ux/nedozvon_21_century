@@ -7,22 +7,17 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ─── CONFIG ───────────────────────────────────────────────────────────────────
-const AMO_DOMAIN = process.env.AMO_DOMAIN; // например: yourcompany.amocrm.ru
-const AMO_TOKEN = process.env.AMO_TOKEN;   // долгосрочный токен
+const AMO_DOMAIN = process.env.AMO_DOMAIN;
+const AMO_TOKEN = process.env.AMO_TOKEN;
 const PIPELINE_ID = 10391694;
 const STAGE_ID = 82141390;
 const GROUP_ID = 689470;
 
-// ─── AMO API HELPER ───────────────────────────────────────────────────────────
 const amo = axios.create({
   baseURL: `https://${AMO_DOMAIN}/api/v4`,
   headers: { Authorization: `Bearer ${AMO_TOKEN}` }
 });
 
-// ─── UTILS ────────────────────────────────────────────────────────────────────
-
-// Получить кол-во рабочих дней между двумя датами (пн-пт)
 function getWorkingDaysBetween(startTs, endTs) {
   let count = 0;
   const start = new Date(startTs * 1000);
@@ -38,23 +33,17 @@ function getWorkingDaysBetween(startTs, endTs) {
   return count;
 }
 
-// ─── AMO DATA FETCHERS ────────────────────────────────────────────────────────
-
-async function getPipelineAndStage() {
-  return { pipelineId: PIPELINE_ID, stageId: STAGE_ID };
-}
-
 async function getGroupUsers() {
-  // Получаем пользователей через настройки виджета (хранятся в кастомном поле)
-  // Либо fallback - из переменной окружения
-  const envUsers = process.env.QUEUE_USERS; // JSON: [{"id":123,"name":"Иванов"}]
+  const envUsers = process.env.QUEUE_USERS;
   if (envUsers) {
     try { return JSON.parse(envUsers); } catch(e) {}
   }
-  // Запрашиваем всех пользователей и фильтруем по группе
   const { data } = await amo.get('/users?limit=250');
   const users = data._embedded?.users || [];
- return users.filter(u => u.rights?.group_id === GROUP_ID && u.rights?.is_active === true).map(u => ({ id: u.id, name: u.name }));
+  return users
+    .filter(u => u.rights?.group_id === GROUP_ID && u.rights?.is_active === true)
+    .map(u => ({ id: u.id, name: u.name }));
+}
 
 async function getLeadsInStage(pipelineId, stageId) {
   let page = 1;
@@ -70,7 +59,7 @@ async function getLeadsInStage(pipelineId, stageId) {
 }
 
 async function createTask(leadId, responsibleUserId, text) {
-  const dueDate = Math.floor(Date.now() / 1000) + 86400; // завтра
+  const dueDate = Math.floor(Date.now() / 1000) + 86400;
   await amo.post('/tasks', [{
     task_type_id: 1,
     text,
@@ -88,105 +77,70 @@ async function getExistingTasks(leadId) {
 }
 
 async function reassignLead(leadId, newUserId, newUserName) {
-  await amo.patch(`/leads`, [{
+  await amo.patch('/leads', [{
     id: leadId,
     responsible_user_id: newUserId
   }]);
-  // Добавляем примечание о переназначении
   await amo.post('/notes', [{
     entity_id: leadId,
     entity_type: 'leads',
     note_type: 'common',
-    params: { text: `🔄 Автоматическое переназначение: лид висел в "Недозвон" 5 рабочих дней. Новый ответственный: ${newUserName}` }
+    params: { text: `🔄 Переназначение: лид висел 5 рабочих дней. Новый ответственный: ${newUserName}` }
   }]);
-  console.log(`🔄 Сделка ${leadId} переназначена на ${newUserName} (id: ${newUserId})`);
+  console.log(`🔄 Сделка ${leadId} переназначена на ${newUserName}`);
 }
 
-// ─── QUEUE STATE ──────────────────────────────────────────────────────────────
-// Хранит индекс следующего в очереди в памяти (сбрасывается при рестарте)
-// Для продакшна можно вынести в файл или БД
 let queueIndex = 0;
 
 function getNextUserFromQueue(users, currentUserId) {
-  // Находим индекс текущего ответственного и берём следующего
   const currentIdx = users.findIndex(u => u.id === currentUserId);
   const nextIdx = (currentIdx + 1) % users.length;
   queueIndex = nextIdx;
   return users[nextIdx];
 }
 
-// ─── MAIN CHECK ───────────────────────────────────────────────────────────────
-
 async function checkLeads() {
   console.log(`\n[${new Date().toISOString()}] Запуск проверки сделок...`);
-  
   try {
-    const { pipelineId, stageId } = await getPipelineAndStage();
     const users = await getGroupUsers();
-    
     if (!users.length) {
       console.log('⚠️ Сотрудники не найдены, пропускаем');
       return;
     }
-    
+    console.log(`👥 Сотрудники: ${users.map(u => u.name).join(', ')}`);
     const userIds = new Set(users.map(u => u.id));
-    const leads = await getLeadsInStage(pipelineId, stageId);
+    const leads = await getLeadsInStage(PIPELINE_ID, STAGE_ID);
     const nowTs = Math.floor(Date.now() / 1000);
-    
-    console.log(`Найдено ${leads.length} сделок в этапе "${STAGE_NAME}"`);
-    
+    console.log(`Найдено ${leads.length} сделок`);
     for (const lead of leads) {
       const responsibleId = lead.responsible_user_id;
-      
-      // Только сотрудники из нужного отдела
       if (!userIds.has(responsibleId)) continue;
-      
-      // status_changed_at — когда сделка попала в текущий этап
       const stageEnteredAt = lead.status_changed_at || lead.created_at;
       const workingDays = getWorkingDaysBetween(stageEnteredAt, nowTs);
-      
-      console.log(`Сделка ${lead.id} "${lead.name}": ${workingDays} рабочих дней в этапе`);
-      
-      // 5+ рабочих дней → переназначить
+      console.log(`Сделка ${lead.id}: ${workingDays} рабочих дней`);
       if (workingDays >= 5) {
         const nextUser = getNextUserFromQueue(users, responsibleId);
         await reassignLead(lead.id, nextUser.id, nextUser.name);
         continue;
       }
-      
-      // 3+ рабочих дней → создать задачу (если ещё не создавали)
       if (workingDays >= 3) {
         const tasks = await getExistingTasks(lead.id);
         const reminderExists = tasks.some(t => t.text?.includes('Что делаем с лидом'));
         if (!reminderExists) {
-          await createTask(
-            lead.id,
-            responsibleId,
-            `⏰ Что делаем с лидом? Сделка "${lead.name}" уже ${workingDays} рабочих дней в этапе "Недозвон". Примите решение.`
-          );
+          await createTask(lead.id, responsibleId, `⏰ Что делаем с лидом? Сделка "${lead.name}" уже ${workingDays} рабочих дней в этапе "~ НЕ дозвонился".`);
         }
       }
     }
-    
     console.log('✅ Проверка завершена\n');
   } catch (err) {
-    console.error('❌ Ошибка при проверке:', err.message);
+    console.error('❌ Ошибка:', err.message);
   }
 }
 
-// ─── CRON: каждые 2 часа в рабочее время пн-пт ───────────────────────────────
-cron.schedule('0 9,11,13,15,17 * * 1-5', checkLeads, {
-  timezone: 'Europe/Moscow'
-});
+cron.schedule('0 9,11,13,15,17 * * 1-5', checkLeads, { timezone: 'Europe/Moscow' });
 
-// ─── ROUTES ───────────────────────────────────────────────────────────────────
-
-// Вебхук от AmoCRM (для будущего использования)
-app.post('/webhook', async (req, res) => {
-  res.sendStatus(200);
-});
-
-// Получить текущий список сотрудников в очереди
+app.get('/', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+app.post('/webhook', (req, res) => res.sendStatus(200));
 app.get('/api/users', async (req, res) => {
   try {
     const users = await getGroupUsers();
@@ -195,28 +149,19 @@ app.get('/api/users', async (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
-
-// Обновить список сотрудников (вызывается из панели виджета)
-app.post('/api/users', express.json(), (req, res) => {
+app.post('/api/users', (req, res) => {
   const { users } = req.body;
   if (!Array.isArray(users)) return res.status(400).json({ error: 'users must be array' });
-  // Сохраняем в env (на Render через переменные окружения)
   process.env.QUEUE_USERS = JSON.stringify(users);
   queueIndex = 0;
   res.json({ success: true, users });
 });
-
-// Ручной запуск проверки (для дебага)
-app.post('/api/check', async (req, res) => {
+app.post('/api/check', (req, res) => {
   checkLeads();
   res.json({ success: true, message: 'Проверка запущена' });
 });
 
-// Health check
-app.get('/', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
-
 app.listen(PORT, () => {
   console.log(`🚀 Сервер запущен на порту ${PORT}`);
-  // Запускаем первую проверку через 5 сек после старта
   setTimeout(checkLeads, 5000);
 });
