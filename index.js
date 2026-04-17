@@ -132,9 +132,13 @@ async function checkLeads() {
       }
     }
     console.log('✅ Проверка завершена\n');
-  } catch (err) {
+ } catch (err) {
     console.error('❌ Ошибка:', err.message);
-  }
+    if (err.response) {
+      console.error('❌ URL:', err.config?.url);
+      console.error('❌ Status:', err.response.status);
+      console.error('❌ Data:', JSON.stringify(err.response.data));
+    }
 }
 
 cron.schedule('0 9,11,13,15,17 * * 1-5', checkLeads, { timezone: 'Europe/Moscow' });
