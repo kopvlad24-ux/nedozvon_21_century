@@ -41,13 +41,8 @@ function getWorkingDaysBetween(startTs, endTs) {
 // ─── AMO DATA FETCHERS ────────────────────────────────────────────────────────
 
 async function getPipelineAndStage() {
-  const { data } = await amo.get('/leads/pipelines');
-  const pipelines = data._embedded?.pipelines || [];
-  const pipeline = pipelines.find(p => p.name === PIPELINE_NAME);
-  if (!pipeline) throw new Error(`Воронка "${PIPELINE_NAME}" не найдена`);
-  const stage = pipeline._embedded?.statuses?.find(s => s.name === STAGE_NAME);
-  if (!stage) throw new Error(`Этап "${STAGE_NAME}" не найден`);
-  return { pipelineId: pipeline.id, stageId: stage.id };
+  return { pipelineId: PIPELINE_ID, stageId: STAGE_ID };
+}
 }
 
 async function getGroupUsers() {
