@@ -54,8 +54,7 @@ async function getGroupUsers() {
   // Запрашиваем всех пользователей и фильтруем по группе
   const { data } = await amo.get('/users?limit=250');
   const users = data._embedded?.users || [];
-  return users.filter(u => u.group?.name === GROUP_NAME).map(u => ({ id: u.id, name: u.name }));
-}
+ return users.filter(u => u.rights?.group_id === GROUP_ID && u.rights?.is_active === true).map(u => ({ id: u.id, name: u.name }));
 
 async function getLeadsInStage(pipelineId, stageId) {
   let page = 1;
