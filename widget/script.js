@@ -1,7 +1,7 @@
 define(['jquery'], function($) {
   var Widget = function() {
     var self = this;
-    var BACKEND_URL = 'https://YOUR-APP.onrender.com'; // заменить на свой URL
+   var BACKEND_URL = 'https://nedozvon-21-century.onrender.com';
 
     this.callbacks = {
       render: function() {
