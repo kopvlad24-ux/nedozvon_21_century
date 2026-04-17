@@ -6,7 +6,6 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-
 const AMO_DOMAIN = process.env.AMO_DOMAIN;
 const AMO_TOKEN = process.env.AMO_TOKEN;
 const PIPELINE_ID = 10391694;
@@ -20,9 +19,8 @@ const amo = axios.create({
 
 function getWorkingDaysBetween(startTs, endTs) {
   let count = 0;
-  const start = new Date(startTs * 1000);
+  const cur = new Date(startTs * 1000);
   const end = new Date(endTs * 1000);
-  const cur = new Date(start);
   cur.setHours(0, 0, 0, 0);
   end.setHours(0, 0, 0, 0);
   while (cur < end) {
@@ -49,7 +47,14 @@ async function getLeadsInStage(pipelineId, stageId) {
   let page = 1;
   let leads = [];
   while (true) {
-    const { data } = await amo.get(`/leads?filter[pipeline_id]=${pipelineId}&filter[status_id]=${stageId}&limit=250&page=${page}`);
+    const { data } = await amo.get('/leads', {
+      params: {
+        'filter[pipeline_id]': pipelineId,
+        'filter[status_id]': stageId,
+        limit: 250,
+        page: page
+      }
+    });
     const batch = data._embedded?.leads || [];
     leads = leads.concat(batch);
     if (batch.length < 250) break;
@@ -62,18 +67,27 @@ async function createTask(leadId, responsibleUserId, text) {
   const dueDate = Math.floor(Date.now() / 1000) + 86400;
   await amo.post('/tasks', [{
     task_type_id: 1,
-    text,
+    text: text,
     complete_till: dueDate,
     entity_id: leadId,
     entity_type: 'leads',
     responsible_user_id: responsibleUserId
   }]);
-  console.log(`✅ Задача создана для сделки ${leadId}`);
+  console.log('Задача создана для сделки ' + leadId);
 }
 
 async function getExistingTasks(leadId) {
-  const { data } = await amo.get(`/tasks?filter[entity_id]=${leadId}&filter[entity_type]=leads`);
-  return data._embedded?.tasks || [];
+  try {
+    const { data } = await amo.get('/tasks', {
+      params: {
+        'filter[entity_id]': leadId,
+        'filter[entity_type]': 'leads'
+      }
+    });
+    return data._embedded?.tasks || [];
+  } catch(e) {
+    return [];
+  }
 }
 
 async function reassignLead(leadId, newUserId, newUserName) {
@@ -81,43 +95,38 @@ async function reassignLead(leadId, newUserId, newUserName) {
     id: leadId,
     responsible_user_id: newUserId
   }]);
-  await amo.post('/notes', [{
-    entity_id: leadId,
-    entity_type: 'leads',
-    note_type: 'common',
-    params: { text: `🔄 Переназначение: лид висел 5 рабочих дней. Новый ответственный: ${newUserName}` }
-  }]);
-  console.log(`🔄 Сделка ${leadId} переназначена на ${newUserName}`);
+  console.log('Сделка ' + leadId + ' переназначена на ' + newUserName);
 }
 
 let queueIndex = 0;
 
 function getNextUserFromQueue(users, currentUserId) {
-  const currentIdx = users.findIndex(u => u.id === currentUserId);
+  const currentIdx = users.findIndex(function(u) { return u.id === currentUserId; });
   const nextIdx = (currentIdx + 1) % users.length;
   queueIndex = nextIdx;
   return users[nextIdx];
 }
 
 async function checkLeads() {
-  console.log(`\n[${new Date().toISOString()}] Запуск проверки сделок...`);
+  console.log('Запуск проверки ' + new Date().toISOString());
   try {
     const users = await getGroupUsers();
     if (!users.length) {
-      console.log('⚠️ Сотрудники не найдены, пропускаем');
+      console.log('Сотрудники не найдены');
       return;
     }
-    console.log(`👥 Сотрудники: ${users.map(u => u.name).join(', ')}`);
-    const userIds = new Set(users.map(u => u.id));
+    console.log('Сотрудники: ' + users.map(function(u) { return u.name; }).join(', '));
+    const userIds = new Set(users.map(function(u) { return u.id; }));
     const leads = await getLeadsInStage(PIPELINE_ID, STAGE_ID);
     const nowTs = Math.floor(Date.now() / 1000);
-    console.log(`Найдено ${leads.length} сделок`);
-    for (const lead of leads) {
+    console.log('Найдено сделок: ' + leads.length);
+    for (let i = 0; i < leads.length; i++) {
+      const lead = leads[i];
       const responsibleId = lead.responsible_user_id;
       if (!userIds.has(responsibleId)) continue;
       const stageEnteredAt = lead.status_changed_at || lead.created_at;
       const workingDays = getWorkingDaysBetween(stageEnteredAt, nowTs);
-      console.log(`Сделка ${lead.id}: ${workingDays} рабочих дней`);
+      console.log('Сделка ' + lead.id + ': ' + workingDays + ' рабочих дней');
       if (workingDays >= 5) {
         const nextUser = getNextUserFromQueue(users, responsibleId);
         await reassignLead(lead.id, nextUser.id, nextUser.name);
@@ -125,47 +134,64 @@ async function checkLeads() {
       }
       if (workingDays >= 3) {
         const tasks = await getExistingTasks(lead.id);
-        const reminderExists = tasks.some(t => t.text?.includes('Что делаем с лидом'));
+        const reminderExists = tasks.some(function(t) {
+          return t.text && t.text.includes('Что делаем с лидом');
+        });
         if (!reminderExists) {
-          await createTask(lead.id, responsibleId, `⏰ Что делаем с лидом? Сделка "${lead.name}" уже ${workingDays} рабочих дней в этапе "~ НЕ дозвонился".`);
+          await createTask(
+            lead.id,
+            responsibleId,
+            'Что делаем с лидом? Сделка висит ' + workingDays + ' рабочих дней в этапе НЕ дозвонился.'
+          );
         }
       }
     }
-    console.log('✅ Проверка завершена\n');
- } catch (err) {
-    console.error('❌ Ошибка:', err.message);
+    console.log('Проверка завершена');
+  } catch (err) {
+    console.error('Ошибка: ' + err.message);
     if (err.response) {
-      console.error('❌ URL:', err.config?.url);
-      console.error('❌ Status:', err.response.status);
-      console.error('❌ Data:', JSON.stringify(err.response.data));
+      console.error('URL: ' + err.config?.url);
+      console.error('Status: ' + err.response.status);
+      console.error('Data: ' + JSON.stringify(err.response.data));
     }
+  }
 }
 
 cron.schedule('0 9,11,13,15,17 * * 1-5', checkLeads, { timezone: 'Europe/Moscow' });
 
-app.get('/', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
-app.post('/webhook', (req, res) => res.sendStatus(200));
-app.get('/api/users', async (req, res) => {
+app.get('/', function(req, res) {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+app.post('/webhook', function(req, res) {
+  res.sendStatus(200);
+});
+
+app.get('/api/users', async function(req, res) {
   try {
     const users = await getGroupUsers();
-    res.json({ success: true, users, currentQueueIndex: queueIndex });
+    res.json({ success: true, users: users, currentQueueIndex: queueIndex });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
-app.post('/api/users', (req, res) => {
-  const { users } = req.body;
-  if (!Array.isArray(users)) return res.status(400).json({ error: 'users must be array' });
+
+app.post('/api/users', function(req, res) {
+  const users = req.body.users;
+  if (!Array.isArray(users)) {
+    return res.status(400).json({ error: 'users must be array' });
+  }
   process.env.QUEUE_USERS = JSON.stringify(users);
   queueIndex = 0;
-  res.json({ success: true, users });
+  res.json({ success: true, users: users });
 });
-app.post('/api/check', (req, res) => {
+
+app.post('/api/check', function(req, res) {
   checkLeads();
   res.json({ success: true, message: 'Проверка запущена' });
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Сервер запущен на порту ${PORT}`);
+app.listen(PORT, function() {
+  console.log('Сервер запущен на порту ' + PORT);
   setTimeout(checkLeads, 5000);
 });
