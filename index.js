@@ -43,7 +43,6 @@ function getWorkingDaysBetween(startTs, endTs) {
 async function getPipelineAndStage() {
   return { pipelineId: PIPELINE_ID, stageId: STAGE_ID };
 }
-}
 
 async function getGroupUsers() {
   // Получаем пользователей через настройки виджета (хранятся в кастомном поле)
