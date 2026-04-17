@@ -39,8 +39,8 @@ async function getGroupUsers() {
   const { data } = await amo.get('/users?limit=250');
   const users = data._embedded?.users || [];
   return users
-    .filter(u => u.rights?.group_id === GROUP_ID && u.rights?.is_active === true)
-    .map(u => ({ id: u.id, name: u.name }));
+    .filter(function(u) { return u.rights && u.rights.group_id === GROUP_ID && u.rights.is_active === true; })
+    .map(function(u) { return { id: u.id, name: u.name }; });
 }
 
 async function getLeadsInStage(pipelineId, stageId) {
@@ -184,6 +184,60 @@ app.post('/api/users', function(req, res) {
   process.env.QUEUE_USERS = JSON.stringify(users);
   queueIndex = 0;
   res.json({ success: true, users: users });
+});
+
+app.post('/api/rollback', async function(req, res) {
+  res.json({ success: true, message: 'Откат запущен, смотри логи' });
+  try {
+    const nameToId = {
+      'Капанадзе Ольга': 13725758,
+      'Кунцевич Виктория': 13695178,
+      'Питаев Алексей': 13299234,
+      'Хаджиева Амина': 13430842,
+      'Данченкова Екатерина': 13430866,
+      'Скуратова Валерия': 13503250,
+      'Гордон Денис': 13515178,
+      'Фатхуллов Рустем': 13324978,
+      'Моджилло Татьяна': 13299178,
+      'Матвеева Аделина': 13729438
+    };
+    const todayStart = Math.floor(new Date().setHours(0,0,0,0) / 1000);
+    const { data } = await amo.get('/events', {
+      params: {
+        'filter[type]': 'lead_responsible_user_changed',
+        'filter[created_at][from]': todayStart,
+        limit: 250,
+        page: 1
+      }
+    });
+    const events = data._embedded?.events || [];
+    console.log('Событий для отката: ' + events.length);
+    const toRestore = {};
+    for (let i = 0; i < events.length; i++) {
+      const event = events[i];
+      const leadId = event.entity_id;
+      const valueBefore = event.value_before && event.value_before[0] && event.value_before[0].responsible_user && event.value_before[0].responsible_user.name;
+      if (!valueBefore || !nameToId[valueBefore]) continue;
+      if (!toRestore[leadId]) {
+        toRestore[leadId] = nameToId[valueBefore];
+      }
+    }
+    const entries = Object.entries(toRestore);
+    console.log('Сделок для отката: ' + entries.length);
+    for (let i = 0; i < entries.length; i += 50) {
+      const batch = entries.slice(i, i + 50);
+      const payload = batch.map(function(e) {
+        return { id: parseInt(e[0]), responsible_user_id: e[1] };
+      });
+      await amo.patch('/leads', payload);
+      console.log('Откатили ' + (i + batch.length) + ' из ' + entries.length);
+      await new Promise(function(r) { setTimeout(r, 500); });
+    }
+    console.log('Откат завершён!');
+  } catch(err) {
+    console.error('Ошибка отката: ' + err.message);
+    if (err.response) console.error(JSON.stringify(err.response.data));
+  }
 });
 
 app.post('/api/check', function(req, res) {
