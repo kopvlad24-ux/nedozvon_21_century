@@ -1,0 +1,16 @@
+{
+  "widget": {
+    "name": "Недозвон — авторемайндер",
+    "description": "Автоматические задачи и перераспределение лидов в этапе Недозвон",
+    "version": "1.0.0",
+    "author": "custom",
+    "lang": "ru",
+    "settings": {
+      "backend_url": {
+        "name": "URL бэкенда (Render)",
+        "type": "text",
+        "required": true
+      }
+    }
+  }
+}
