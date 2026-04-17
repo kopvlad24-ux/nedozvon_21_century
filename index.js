@@ -12,7 +12,7 @@ const AMO_DOMAIN = process.env.AMO_DOMAIN; // например: yourcompany.amoc
 const AMO_TOKEN = process.env.AMO_TOKEN;   // долгосрочный токен
 const PIPELINE_ID = 10391694;
 const STAGE_ID = 82141390;
-const GROUP_NAME = 'Клуб чемпионов';
+const GROUP_ID = 689470;
 
 // ─── AMO API HELPER ───────────────────────────────────────────────────────────
 const amo = axios.create({
