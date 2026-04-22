@@ -111,7 +111,7 @@ async function buildResponsibleChangeMap() {
   while (true) {
     const { data } = await amo.get('/events', {
       params: {
-        'filter[type]': 'lead_responsible_user_changed',
+        'filter[type][]': 'lead_responsible_user_changed',
         'filter[created_at][from]': fromTs,
         limit: 250,
         page
@@ -312,7 +312,7 @@ app.post('/api/rollback', async (req, res) => {
     const todayStart = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
     const { data } = await amo.get('/events', {
       params: {
-        'filter[type]': 'lead_responsible_user_changed',
+        'filter[type][]': 'lead_responsible_user_changed',
         'filter[created_at][from]': todayStart,
         limit: 250, page: 1
       }
