@@ -44,7 +44,7 @@ async function getActiveQueue() {
   });
   const rows = res.data.values || [];
   return rows
-    .filter(r => r[2] && r[2].toString().toUpperCase() === 'TRUE')
+    .filter(r => r[2] && ['TRUE', 'ИСТИНА', '1', 'YES'].includes(r[2].toString().toUpperCase()))
     .map(r => ({ id: parseInt(r[0]), name: r[1] }));
 }
 
