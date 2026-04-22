@@ -111,13 +111,14 @@ async function buildResponsibleChangeMap() {
   while (true) {
     const { data } = await amo.get('/events', {
       params: {
-        'filter[type][]': 'lead_responsible_user_changed',
+        'filter[entity]': 'leads',
         'filter[created_at][from]': fromTs,
         limit: 250,
         page
       }
     });
-    const events = data._embedded?.events || [];
+    const events = (data._embedded?.events || [])
+      .filter(e => e.type === 'lead_responsible_user_changed');
     for (const event of events) {
       const leadId = event.entity_id;
       const ts = event.created_at;
