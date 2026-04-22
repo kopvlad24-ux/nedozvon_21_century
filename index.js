@@ -36,16 +36,24 @@ function getSheetsClient() {
   return google.sheets({ version: 'v4', auth });
 }
 
-async function getActiveQueue() {
+const TRUTHY = ['TRUE', 'ИСТИНА', '1', 'YES'];
+
+async function getQueueData() {
   const sheets = getSheetsClient();
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range: 'queue!A2:C100'
+    range: 'queue!A2:D100'
   });
   const rows = res.data.values || [];
-  return rows
-    .filter(r => r[2] && ['TRUE', 'ИСТИНА', '1', 'YES'].includes(r[2].toString().toUpperCase()))
+  // active=C → мониторим лиды этого брокера
+  // distribute=D → этот брокер получает лиды при переназначении
+  const monitored = rows
+    .filter(r => r[2] && TRUTHY.includes(r[2].toString().toUpperCase()))
     .map(r => ({ id: parseInt(r[0]), name: r[1] }));
+  const distribute = rows
+    .filter(r => r[3] && TRUTHY.includes(r[3].toString().toUpperCase()))
+    .map(r => ({ id: parseInt(r[0]), name: r[1] }));
+  return { monitored, distribute };
 }
 
 async function getLastAssignedId() {
@@ -75,17 +83,17 @@ async function setLastAssignedId(userId) {
 // ─── Очередь ──────────────────────────────────────────────────────────────────
 
 async function getNextUser(currentResponsibleId) {
-  const queue = await getActiveQueue();
-  if (!queue.length) throw new Error('Очередь пуста');
+  const { distribute } = await getQueueData();
+  if (!distribute.length) throw new Error('Список выдачи пуст — добавьте сотрудников с distribute=TRUE');
 
   const lastId = await getLastAssignedId();
-  const lastIdx = queue.findIndex(u => u.id === lastId);
+  const lastIdx = distribute.findIndex(u => u.id === lastId);
 
-  for (let i = 1; i <= queue.length; i++) {
-    const candidate = queue[(lastIdx + i) % queue.length];
+  for (let i = 1; i <= distribute.length; i++) {
+    const candidate = distribute[(lastIdx + i) % distribute.length];
     if (candidate.id !== currentResponsibleId) return candidate;
   }
-  return queue[0];
+  return distribute[0];
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -104,35 +112,10 @@ function getWorkingDaysBetween(startTs, endTs) {
   return count;
 }
 
+// События AmoCRM не поддерживают фильтр по типу в v4 — используем status_changed_at лида
+// В будущем можно заменить на индивидуальные запросы событий по каждому лиду
 async function buildResponsibleChangeMap() {
-  const fromTs = Math.floor(Date.now() / 1000) - 30 * 24 * 3600;
-  let page = 1;
-  const map = new Map();
-  while (true) {
-    const { data } = await amo.get('/events', {
-      params: {
-        'filter[entity]': 'leads',
-        'filter[created_at][from]': fromTs,
-        limit: 250,
-        page
-      }
-    });
-    const events = (data._embedded?.events || [])
-      .filter(e => e.type === 'lead_responsible_user_changed');
-    for (const event of events) {
-      const leadId = event.entity_id;
-      const ts = event.created_at;
-      const userId = event.value_after?.[0]?.responsible_user?.id;
-      if (!userId) continue;
-      const existing = map.get(leadId);
-      if (!existing || ts > existing.timestamp) {
-        map.set(leadId, { userId, timestamp: ts });
-      }
-    }
-    if (events.length < 250) break;
-    page++;
-  }
-  return map;
+  return new Map(); // пустая карта — используем status_changed_at
 }
 
 async function getLeadsInStage() {
@@ -206,15 +189,14 @@ async function reassignAndMove(lead, nextUser) {
 async function checkLeads() {
   console.log(`\n=== Проверка ${new Date().toISOString()}${DRY_RUN ? ' [DRY_RUN]' : ''} ===`);
   try {
-    const queue = await getActiveQueue();
-    if (!queue.length) { console.log('Очередь пуста'); return; }
-    const queueIds = new Set(queue.map(u => u.id));
-    console.log(`Очередь: ${queue.map(u => u.name).join(', ')}`);
+    const { monitored, distribute } = await getQueueData();
+    if (!monitored.length) { console.log('Список мониторинга пуст'); return; }
+    if (!distribute.length) { console.log('Список выдачи пуст'); return; }
+    const monitoredIds = new Set(monitored.map(u => u.id));
+    console.log(`Мониторим: ${monitored.map(u => u.name).join(', ')}`);
+    console.log(`Выдаём: ${distribute.map(u => u.name).join(', ')}`);
 
-    const [leads, eventMap] = await Promise.all([
-      getLeadsInStage(),
-      buildResponsibleChangeMap()
-    ]);
+    const leads = await getLeadsInStage();
     console.log(`Лидов в этапе НЕ дозвонился: ${leads.length}`);
     const nowTs = Math.floor(Date.now() / 1000);
 
@@ -224,13 +206,13 @@ async function checkLeads() {
         continue;
       }
       const responsibleId = lead.responsible_user_id;
-      if (!queueIds.has(responsibleId)) {
+      if (!monitoredIds.has(responsibleId)) {
         console.log(`Сделка ${lead.id}: ответственный не в очереди, пропуск`);
         continue;
       }
 
-      const eventData = eventMap.get(lead.id);
-      const responsibleSinceTs = eventData ? eventData.timestamp : lead.created_at;
+      // Считаем дни от момента входа в этап НЕ дозвонился
+      const responsibleSinceTs = lead.status_changed_at || lead.created_at;
       const workingDays = getWorkingDaysBetween(responsibleSinceTs, nowTs);
       console.log(`Сделка ${lead.id} (${lead.name}): ${workingDays} рабочих дней у ответственного`);
 
@@ -278,9 +260,9 @@ app.post('/api/check', (req, res) => {
 
 app.get('/api/queue', async (req, res) => {
   try {
-    const queue = await getActiveQueue();
+    const { monitored, distribute } = await getQueueData();
     const lastId = await getLastAssignedId();
-    res.json({ success: true, queue, lastAssignedId: lastId });
+    res.json({ success: true, monitored, distribute, lastAssignedId: lastId });
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
