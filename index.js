@@ -130,14 +130,17 @@ async function updateStats() {
   const weekStart = getWeekStart();
   const monthStart = getMonthStart();
 
-  // Считаем статистику
-  const weekStats = {}; // { name: { received: 0, taken: 0 } }
-  const monthStats = {};
+  const MONTHS_RU = ['Январь','Февраль','Март','Апрель','Май','Июнь',
+    'Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
 
   function add(map, name, key) {
     if (!map[name]) map[name] = { received: 0, taken: 0 };
     map[name][key]++;
   }
+
+  // Считаем статистику по неделе и по месяцам (все месяцы из лога)
+  const weekStats = {};
+  const allMonthStats = {}; // { 'Апрель 2026': { name: { received, taken } } }
 
   for (const row of rows) {
     const [dateStr, , , fromName, toName] = row;
@@ -145,17 +148,20 @@ async function updateStats() {
     let date;
     try { date = parseRuDate(dateStr); } catch { continue; }
 
-    if (date >= monthStart) {
-      add(monthStats, fromName, 'taken');
-      add(monthStats, toName, 'received');
-    }
+    // Неделя
     if (date >= weekStart) {
       add(weekStats, fromName, 'taken');
       add(weekStats, toName, 'received');
     }
+
+    // Месяц — группируем по "Апрель 2026" и т.д.
+    const monthKey = `${MONTHS_RU[date.getMonth()]} ${date.getFullYear()}`;
+    if (!allMonthStats[monthKey]) allMonthStats[monthKey] = {};
+    add(allMonthStats[monthKey], fromName, 'taken');
+    add(allMonthStats[monthKey], toName, 'received');
   }
 
-  // Записываем week
+  // Записываем week (перезаписываем текущую неделю)
   const weekRows = [['Сотрудник', 'Получено лидов', 'Снято лидов']];
   for (const [name, s] of Object.entries(weekStats)) {
     weekRows.push([name, s.received, s.taken]);
@@ -168,18 +174,35 @@ async function updateStats() {
     requestBody: { values: weekRows }
   });
 
-  // Записываем month
-  const monthRows = [['Сотрудник', 'Получено лидов', 'Снято лидов']];
-  for (const [name, s] of Object.entries(monthStats)) {
-    monthRows.push([name, s.received, s.taken]);
-  }
-  await sheets.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'month!A:C' });
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range: 'month!A1',
-    valueInputOption: 'RAW',
-    requestBody: { values: monthRows }
+  // Записываем month — все месяцы блоками
+  const monthRows = [];
+  const sortedMonths = Object.keys(allMonthStats).sort((a, b) => {
+    // Сортируем хронологически
+    const [mA, yA] = a.split(' ');
+    const [mB, yB] = b.split(' ');
+    const idxA = MONTHS_RU.indexOf(mA) + parseInt(yA) * 12;
+    const idxB = MONTHS_RU.indexOf(mB) + parseInt(yB) * 12;
+    return idxA - idxB;
   });
+
+  for (const monthKey of sortedMonths) {
+    monthRows.push([monthKey, '', '']);
+    monthRows.push(['Сотрудник', 'Получено лидов', 'Снято лидов']);
+    for (const [name, s] of Object.entries(allMonthStats[monthKey])) {
+      monthRows.push([name, s.received, s.taken]);
+    }
+    monthRows.push(['', '', '']); // пустая строка между месяцами
+  }
+
+  await sheets.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'month!A:C' });
+  if (monthRows.length) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: 'month!A1',
+      valueInputOption: 'RAW',
+      requestBody: { values: monthRows }
+    });
+  }
 
   console.log('Статистика обновлена');
 }
