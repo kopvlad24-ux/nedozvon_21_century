@@ -331,17 +331,39 @@ async function reassignAndMove(lead, fromUser, nextUser) {
     console.log(`[DRY_RUN] Сделка ${lead.id} → ${nextUser.name}, этап → Новая заявка`);
     return;
   }
+
+  // Меняем ответственного в сделке и этап
   await amo.patch('/leads', [{
     id: lead.id,
     responsible_user_id: nextUser.id,
     status_id: STAGE_NEW,
     pipeline_id: PIPELINE_ID
   }]);
+
+  // Меняем ответственного в контактах сделки
+  try {
+    const { data: leadData } = await amo.get(`/leads/${lead.id}`, {
+      params: { with: 'contacts' }
+    });
+    const contacts = leadData._embedded?.contacts || [];
+    if (contacts.length) {
+      await amo.patch('/contacts', contacts.map(c => ({
+        id: c.id,
+        responsible_user_id: nextUser.id
+      })));
+      console.log(`Контакты сделки ${lead.id} переназначены (${contacts.length} шт.)`);
+    }
+  } catch (e) {
+    console.warn(`Не удалось переназначить контакты сделки ${lead.id}: ${e.message}`);
+  }
+
+  // Комментарий в карточку
   await amo.post('/leads/notes', [{
     entity_id: lead.id,
     note_type: 'common',
     params: { text: `🔄 Лид передан по распределению → ${nextUser.name}` }
   }]);
+
   await writeLog(lead.id, lead.name, fromUser.name, nextUser.name);
   console.log(`Сделка ${lead.id} → ${nextUser.name} | Новая заявка`);
 }
