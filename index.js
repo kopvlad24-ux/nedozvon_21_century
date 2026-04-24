@@ -15,6 +15,7 @@ const SHEET_ID = process.env.SHEET_ID;
 const PIPELINE_ID = 10391694;
 const STAGE_NEDOZVON = 82141390;
 const STAGE_NEW = 82141386;
+const GROUP_ID = 689470;
 
 const DRY_RUN = process.env.DRY_RUN !== 'false';
 
@@ -45,8 +46,6 @@ async function getQueueData() {
     range: 'queue!A2:D100'
   });
   const rows = res.data.values || [];
-  // active=C → мониторим лиды этого брокера
-  // distribute=D → этот брокер получает лиды при переназначении
   const monitored = rows
     .filter(r => r[2] && TRUTHY.includes(r[2].toString().toUpperCase()))
     .map(r => ({ id: parseInt(r[0]), name: r[1] }));
@@ -67,10 +66,7 @@ async function getLastAssignedId() {
 }
 
 async function setLastAssignedId(userId) {
-  if (DRY_RUN) {
-    console.log(`[DRY_RUN] Sheets: last_assigned_id = ${userId}`);
-    return;
-  }
+  if (DRY_RUN) { console.log(`[DRY_RUN] Sheets: last_assigned_id = ${userId}`); return; }
   const sheets = getSheetsClient();
   await sheets.spreadsheets.values.update({
     spreadsheetId: SHEET_ID,
@@ -80,15 +76,163 @@ async function setLastAssignedId(userId) {
   });
 }
 
+// ─── Лог переназначений ───────────────────────────────────────────────────────
+
+async function writeLog(leadId, leadName, fromName, toName) {
+  if (DRY_RUN) { console.log(`[DRY_RUN] Лог: ${leadId} от ${fromName} → ${toName}`); return; }
+  const sheets = getSheetsClient();
+  const now = new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' });
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: 'log!A:E',
+    valueInputOption: 'RAW',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values: [[now, leadId, leadName || '', fromName, toName]] }
+  });
+}
+
+// ─── Обновление статистики ────────────────────────────────────────────────────
+
+function getWeekStart() {
+  const now = new Date();
+  const day = now.getDay();
+  const diff = (day === 0 ? -6 : 1 - day);
+  const monday = new Date(now);
+  monday.setDate(now.getDate() + diff);
+  monday.setHours(0, 0, 0, 0);
+  return monday;
+}
+
+function getMonthStart() {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), 1);
+}
+
+function parseRuDate(str) {
+  // Формат: "22.04.2026, 14:30:00"
+  const [datePart] = str.split(', ');
+  const [d, m, y] = datePart.split('.');
+  return new Date(parseInt(y), parseInt(m) - 1, parseInt(d));
+}
+
+async function updateStats() {
+  if (DRY_RUN) { console.log('[DRY_RUN] Пропуск обновления статистики'); return; }
+  const sheets = getSheetsClient();
+
+  // Читаем весь лог
+  const logRes = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: 'log!A2:E10000'
+  });
+  const rows = logRes.data.values || [];
+  if (!rows.length) return;
+
+  const weekStart = getWeekStart();
+  const monthStart = getMonthStart();
+
+  // Считаем статистику
+  const weekStats = {}; // { name: { received: 0, taken: 0 } }
+  const monthStats = {};
+
+  function add(map, name, key) {
+    if (!map[name]) map[name] = { received: 0, taken: 0 };
+    map[name][key]++;
+  }
+
+  for (const row of rows) {
+    const [dateStr, , , fromName, toName] = row;
+    if (!dateStr || !fromName || !toName) continue;
+    let date;
+    try { date = parseRuDate(dateStr); } catch { continue; }
+
+    if (date >= monthStart) {
+      add(monthStats, fromName, 'taken');
+      add(monthStats, toName, 'received');
+    }
+    if (date >= weekStart) {
+      add(weekStats, fromName, 'taken');
+      add(weekStats, toName, 'received');
+    }
+  }
+
+  // Записываем week
+  const weekRows = [['Сотрудник', 'Получено лидов', 'Снято лидов']];
+  for (const [name, s] of Object.entries(weekStats)) {
+    weekRows.push([name, s.received, s.taken]);
+  }
+  await sheets.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'week!A:C' });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: 'week!A1',
+    valueInputOption: 'RAW',
+    requestBody: { values: weekRows }
+  });
+
+  // Записываем month
+  const monthRows = [['Сотрудник', 'Получено лидов', 'Снято лидов']];
+  for (const [name, s] of Object.entries(monthStats)) {
+    monthRows.push([name, s.received, s.taken]);
+  }
+  await sheets.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'month!A:C' });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: 'month!A1',
+    valueInputOption: 'RAW',
+    requestBody: { values: monthRows }
+  });
+
+  console.log('Статистика обновлена');
+}
+
+// ─── Синхронизация сотрудников из AmoCRM ──────────────────────────────────────
+
+async function syncUsers() {
+  console.log('Синхронизация сотрудников из AmoCRM...');
+  const sheets = getSheetsClient();
+
+  // Получаем всех пользователей группы из AmoCRM
+  const { data } = await amo.get('/users', { params: { limit: 250 } });
+  const allUsers = data._embedded?.users || [];
+  const groupUsers = allUsers.filter(u =>
+    u.rights?.group_id === GROUP_ID && u.rights?.is_active === true
+  );
+
+  // Читаем текущий лист queue
+  const queueRes = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: 'queue!A2:D100'
+  });
+  const existingRows = queueRes.data.values || [];
+  const existingIds = new Set(existingRows.map(r => parseInt(r[0])));
+
+  // Добавляем новых — только тех кого нет в таблице
+  const newRows = groupUsers
+    .filter(u => !existingIds.has(u.id))
+    .map(u => [u.id, u.name, 'FALSE', 'FALSE']);
+
+  if (newRows.length) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: 'queue!A2',
+      valueInputOption: 'RAW',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: newRows }
+    });
+    console.log(`Добавлено новых сотрудников: ${newRows.length} — ${newRows.map(r => r[1]).join(', ')}`);
+  } else {
+    console.log('Новых сотрудников не найдено');
+  }
+
+  return { added: newRows.length, users: newRows.map(r => ({ id: r[0], name: r[1] })) };
+}
+
 // ─── Очередь ──────────────────────────────────────────────────────────────────
 
 async function getNextUser(currentResponsibleId) {
   const { distribute } = await getQueueData();
-  if (!distribute.length) throw new Error('Список выдачи пуст — добавьте сотрудников с distribute=TRUE');
-
+  if (!distribute.length) throw new Error('Список выдачи пуст');
   const lastId = await getLastAssignedId();
   const lastIdx = distribute.findIndex(u => u.id === lastId);
-
   for (let i = 1; i <= distribute.length; i++) {
     const candidate = distribute[(lastIdx + i) % distribute.length];
     if (candidate.id !== currentResponsibleId) return candidate;
@@ -110,12 +254,6 @@ function getWorkingDaysBetween(startTs, endTs) {
     cur.setDate(cur.getDate() + 1);
   }
   return count;
-}
-
-// События AmoCRM не поддерживают фильтр по типу в v4 — используем status_changed_at лида
-// В будущем можно заменить на индивидуальные запросы событий по каждому лиду
-async function buildResponsibleChangeMap() {
-  return new Map(); // пустая карта — используем status_changed_at
 }
 
 async function getLeadsInStage() {
@@ -165,7 +303,7 @@ async function createTask(leadId, responsibleUserId, text) {
   console.log(`Задача создана: ${leadId}`);
 }
 
-async function reassignAndMove(lead, nextUser) {
+async function reassignAndMove(lead, fromUser, nextUser) {
   if (DRY_RUN) {
     console.log(`[DRY_RUN] Сделка ${lead.id} → ${nextUser.name}, этап → Новая заявка`);
     return;
@@ -181,6 +319,7 @@ async function reassignAndMove(lead, nextUser) {
     note_type: 'common',
     params: { text: `🔄 Лид передан по распределению → ${nextUser.name}` }
   }]);
+  await writeLog(lead.id, lead.name, fromUser.name, nextUser.name);
   console.log(`Сделка ${lead.id} → ${nextUser.name} | Новая заявка`);
 }
 
@@ -193,12 +332,14 @@ async function checkLeads() {
     if (!monitored.length) { console.log('Список мониторинга пуст'); return; }
     if (!distribute.length) { console.log('Список выдачи пуст'); return; }
     const monitoredIds = new Set(monitored.map(u => u.id));
+    const monitoredMap = Object.fromEntries(monitored.map(u => [u.id, u]));
     console.log(`Мониторим: ${monitored.map(u => u.name).join(', ')}`);
     console.log(`Выдаём: ${distribute.map(u => u.name).join(', ')}`);
 
     const leads = await getLeadsInStage();
     console.log(`Лидов в этапе НЕ дозвонился: ${leads.length}`);
     const nowTs = Math.floor(Date.now() / 1000);
+    let statsUpdated = false;
 
     for (const lead of leads) {
       if (lead.pipeline_id !== PIPELINE_ID || lead.status_id !== STAGE_NEDOZVON) {
@@ -211,15 +352,16 @@ async function checkLeads() {
         continue;
       }
 
-      // Считаем дни от момента входа в этап НЕ дозвонился
       const responsibleSinceTs = lead.status_changed_at || lead.created_at;
       const workingDays = getWorkingDaysBetween(responsibleSinceTs, nowTs);
-      console.log(`Сделка ${lead.id} (${lead.name}): ${workingDays} рабочих дней у ответственного`);
+      console.log(`Сделка ${lead.id} (${lead.name}): ${workingDays} рабочих дней`);
 
       if (workingDays >= 5) {
+        const fromUser = monitoredMap[responsibleId];
         const nextUser = await getNextUser(responsibleId);
-        await reassignAndMove(lead, nextUser);
+        await reassignAndMove(lead, fromUser, nextUser);
         await setLastAssignedId(nextUser.id);
+        statsUpdated = true;
         continue;
       }
 
@@ -234,6 +376,8 @@ async function checkLeads() {
         }
       }
     }
+
+    if (statsUpdated) await updateStats();
     console.log('Проверка завершена');
   } catch (err) {
     console.error('Ошибка:', err.message);
@@ -266,41 +410,44 @@ app.get('/api/queue', async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-app.post('/api/queue', async (req, res) => {
-  const { users } = req.body;
-  if (!Array.isArray(users)) return res.status(400).json({ error: 'users must be array' });
+// Синхронизация сотрудников из AmoCRM → Sheets
+app.post('/api/sync-users', async (req, res) => {
   try {
-    const sheets = getSheetsClient();
-    const rows = users.map(u => [u.id, u.name, u.active ? 'TRUE' : 'FALSE']);
-    await sheets.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'queue!A2:C100' });
-    if (rows.length) {
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SHEET_ID,
-        range: 'queue!A2',
-        valueInputOption: 'RAW',
-        requestBody: { values: rows }
-      });
-    }
-    res.json({ success: true, users });
-  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+    const result = await syncUsers();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('Ошибка sync-users:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Пересчёт статистики вручную
+app.post('/api/update-stats', async (req, res) => {
+  try {
+    await updateStats();
+    res.json({ success: true, message: 'Статистика обновлена' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 app.post('/api/rollback', async (req, res) => {
   res.json({ success: true, message: 'Откат запущен, смотри логи' });
   try {
-    const queue = await getActiveQueue();
+    const { monitored } = await getQueueData();
     const nameToId = {};
-    queue.forEach(u => { nameToId[u.name] = u.id; });
+    monitored.forEach(u => { nameToId[u.name] = u.id; });
 
     const todayStart = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
     const { data } = await amo.get('/events', {
       params: {
-        'filter[type][]': 'lead_responsible_user_changed',
+        'filter[entity]': 'leads',
         'filter[created_at][from]': todayStart,
         limit: 250, page: 1
       }
     });
-    const events = data._embedded?.events || [];
+    const events = (data._embedded?.events || [])
+      .filter(e => e.type === 'lead_responsible_user_changed');
     console.log(`Событий для отката: ${events.length}`);
 
     const toRestore = {};
