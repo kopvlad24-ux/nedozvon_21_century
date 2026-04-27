@@ -15,6 +15,8 @@ const SHEET_ID = process.env.SHEET_ID;
 const PIPELINE_ID = 10391694;
 const STAGE_NEDOZVON = 82141390;
 const STAGE_NEW = 82141386;
+const STAGE_ARCHIVE = 143;
+const STAGE_ARCHIVE = 143;
 const GROUP_ID = 689470;
 
 const DRY_RUN = process.env.DRY_RUN !== 'false';
@@ -59,6 +61,17 @@ async function getQueueData() {
   return { monitored, distribute };
 }
 
+// Все сотрудники из листа queue (независимо от active/distribute)
+async function getAllQueueUserIds() {
+  const sheets = getSheetsClient();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: 'queue!A2:A100'
+  });
+  const rows = res.data.values || [];
+  return new Set(rows.map(r => parseInt(r[0])).filter(id => !isNaN(id)));
+}
+
 async function getLastAssignedId() {
   const sheets = getSheetsClient();
   const res = await sheets.spreadsheets.values.get({
@@ -82,7 +95,10 @@ async function setLastAssignedId(userId) {
 
 // ─── Assignments — когда виджет назначил лид ──────────────────────────────────
 
-// Читаем все assignments в Map { leadId → timestamp }
+// Читаем все assignments
+// Возвращает:
+//   tsMap: Map { leadId → lastAssignedTs } — когда последний раз виджет назначал лид
+//   historyMap: Map { leadId → Set<userId> } — кто уже был ответственным за лид
 async function getAssignmentsMap() {
   const sheets = getSheetsClient();
   try {
@@ -91,19 +107,28 @@ async function getAssignmentsMap() {
       range: 'assignments!A2:C10000'
     });
     const rows = res.data.values || [];
-    const map = new Map();
+    const tsMap = new Map();
+    const historyMap = new Map();
     for (const row of rows) {
       const leadId = parseInt(row[0]);
+      const userId = parseInt(row[1]);
       const ts = parseInt(row[2]);
-      if (!leadId || !ts) continue;
-      // Если один лид переназначался несколько раз — берём последнее
-      const existing = map.get(leadId);
-      if (!existing || ts > existing) map.set(leadId, ts);
+      if (!leadId) continue;
+      // Последняя дата назначения
+      if (ts) {
+        const existing = tsMap.get(leadId);
+        if (!existing || ts > existing) tsMap.set(leadId, ts);
+      }
+      // История ответственных
+      if (userId) {
+        if (!historyMap.has(leadId)) historyMap.set(leadId, new Set());
+        historyMap.get(leadId).add(userId);
+      }
     }
-    return map;
+    return { tsMap, historyMap };
   } catch (e) {
     console.warn('Не удалось прочитать assignments:', e.message);
-    return new Map();
+    return { tsMap: new Map(), historyMap: new Map() };
   }
 }
 
@@ -262,13 +287,51 @@ async function syncUsers() {
   return { added: newRows.length, users: newRows.map(r => ({ id: r[0], name: r[1] })) };
 }
 
+// ─── Все сотрудники группы ───────────────────────────────────────────────────
+
+async function getGroupUserIds() {
+  const { data } = await amo.get('/users', { params: { limit: 250 } });
+  const users = data._embedded?.users || [];
+  return new Set(
+    users
+      .filter(u => u.rights?.group_id === GROUP_ID && u.rights?.is_active === true)
+      .map(u => u.id)
+  );
+}
+
+// ─── Архивирование ────────────────────────────────────────────────────────────
+
+async function archiveLead(lead) {
+  if (DRY_RUN) {
+    console.log(`[DRY_RUN] Сделка ${lead.id} → Архив (прошла по всем сотрудникам группы)`);
+    return;
+  }
+  await amo.patch('/leads', [{
+    id: lead.id,
+    status_id: STAGE_ARCHIVE,
+    pipeline_id: PIPELINE_ID
+  }]);
+  await amo.post('/leads/notes', [{
+    entity_id: lead.id,
+    note_type: 'common',
+    params: { text: '📁 Лид отправлен в архив — прошёл через всех сотрудников группы' }
+  }]);
+  console.log(`Сделка ${lead.id} → Архив`);
+}
+
 // ─── Очередь ──────────────────────────────────────────────────────────────────
 
-async function getNextUser(currentResponsibleId) {
-  const { distribute } = await getQueueData();
+function pickNextUser(distribute, lastAssignedId, currentResponsibleId, leadHistory) {
   if (!distribute.length) throw new Error('Список выдачи пуст');
-  const lastId = await getLastAssignedId();
-  const lastIdx = distribute.findIndex(u => u.id === lastId);
+  const lastIdx = distribute.findIndex(u => u.id === lastAssignedId);
+  // Первый проход: ищем того кто не был ответственным за этот лид и не текущий
+  for (let i = 1; i <= distribute.length; i++) {
+    const candidate = distribute[(lastIdx + i) % distribute.length];
+    if (candidate.id === currentResponsibleId) continue;
+    if (leadHistory && leadHistory.has(candidate.id)) continue;
+    return candidate;
+  }
+  // Второй проход: все уже были — просто пропускаем текущего ответственного
   for (let i = 1; i <= distribute.length; i++) {
     const candidate = distribute[(lastIdx + i) % distribute.length];
     if (candidate.id !== currentResponsibleId) return candidate;
@@ -381,6 +444,24 @@ async function reassignAndMove(lead, fromUser, nextUser) {
   console.log(`Сделка ${lead.id} → ${nextUser.name} | Новая заявка`);
 }
 
+async function archiveLead(lead, fromUser) {
+  if (DRY_RUN) {
+    console.log(`[DRY_RUN] Сделка ${lead.id} → Архив (прошла по всем сотрудникам)`);
+    return;
+  }
+  await amo.patch('/leads', [{
+    id: lead.id,
+    status_id: STAGE_ARCHIVE,
+    pipeline_id: PIPELINE_ID
+  }]);
+  await amo.post('/leads/notes', [{
+    entity_id: lead.id,
+    note_type: 'common',
+    params: { text: `📁 Лид отправлен в архив — прошёл через всех сотрудников без результата` }
+  }]);
+  console.log(`Сделка ${lead.id} → Архив`);
+}
+
 // ─── Основная проверка ────────────────────────────────────────────────────────
 
 async function checkLeads() {
@@ -391,16 +472,21 @@ async function checkLeads() {
     if (!distribute.length) { console.log('Список выдачи пуст'); return; }
     const monitoredIds = new Set(monitored.map(u => u.id));
     const monitoredMap = Object.fromEntries(monitored.map(u => [u.id, u]));
+    // distribute уже получен выше из getQueueData
     console.log(`Мониторим: ${monitored.map(u => u.name).join(', ')}`);
     console.log(`Выдаём: ${distribute.map(u => u.name).join(', ')}`);
 
-    const [leads, assignmentsMap] = await Promise.all([
+    const [leads, assignments, lastAssignedId, allQueueUserIds] = await Promise.all([
       getLeadsInStage(),
-      getAssignmentsMap()
+      getAssignmentsMap(),
+      getLastAssignedId(),
+      getAllQueueUserIds()
     ]);
+    const { tsMap: assignmentsMap, historyMap } = assignments;
     console.log(`Лидов в этапе НЕ дозвонился: ${leads.length}`);
     const nowTs = Math.floor(Date.now() / 1000);
     let statsUpdated = false;
+    let currentLastAssignedId = lastAssignedId; // обновляем локально по ходу цикла
 
     for (const lead of leads) {
       // Двойная защита — только нужный этап
@@ -416,7 +502,8 @@ async function checkLeads() {
       }
 
       // Определяем точку отсчёта
-      const assignedTs = assignmentsMap.get(lead.id); // виджет назначал?
+      const assignedTs = assignmentsMap.get(lead.id); // когда виджет последний раз назначал
+      const leadHistory = historyMap.get(lead.id); // кто уже был ответственным
       const statusChangedTs = lead.status_changed_at || lead.created_at;
 
       let sinceTs;
@@ -437,10 +524,26 @@ async function checkLeads() {
 
       if (workingDays >= 5) {
         const fromUser = monitoredMap[responsibleId];
-        const nextUser = await getNextUser(responsibleId);
-        await reassignAndMove(lead, fromUser, nextUser);
-        await setLastAssignedId(nextUser.id);
-        statsUpdated = true;
+
+        // Проверяем прошёл ли лид через всех сотрудников группы
+        const allGroupIds = await getGroupUserIds();
+        // Добавляем текущего ответственного в историю для проверки
+        const fullHistory = leadHistory ? new Set([...leadHistory, responsibleId]) : new Set([responsibleId]);
+        const allVisited = [...allGroupIds].every(id => fullHistory.has(id));
+
+        if (allVisited) {
+          // Все были — архив
+          await archiveLead(lead);
+          await writeLog(lead.id, lead.name, fromUser.name, '~ Архив');
+          statsUpdated = true;
+        } else {
+          // Есть ещё кандидаты — переназначаем
+          const nextUser = pickNextUser(distribute, currentLastAssignedId, responsibleId, leadHistory);
+          await reassignAndMove(lead, fromUser, nextUser);
+          await setLastAssignedId(nextUser.id);
+          currentLastAssignedId = nextUser.id;
+          statsUpdated = true;
+        }
         continue;
       }
 
