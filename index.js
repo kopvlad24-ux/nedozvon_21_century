@@ -16,7 +16,6 @@ const PIPELINE_ID = 10391694;
 const STAGE_NEDOZVON = 82141390;
 const STAGE_NEW = 82141386;
 const STAGE_ARCHIVE = 143;
-const STAGE_ARCHIVE = 143;
 const GROUP_ID = 689470;
 
 const DRY_RUN = process.env.DRY_RUN !== 'false';
