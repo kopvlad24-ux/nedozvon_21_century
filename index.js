@@ -500,23 +500,17 @@ async function checkLeads() {
         continue;
       }
 
-      // Определяем точку отсчёта
-      const assignedTs = assignmentsMap.get(lead.id); // когда виджет последний раз назначал
-      const leadHistory = historyMap.get(lead.id); // кто уже был ответственным
+      // Определяем точку отсчёта — всегда от момента попадания в этап Недозвон
+      const leadHistory = historyMap.get(lead.id); // кто уже был ответственным (для исключения повторов)
       const statusChangedTs = lead.status_changed_at || lead.created_at;
 
-      let sinceTs;
-      if (assignedTs) {
-        // Виджет назначал этот лид — считаем от этого момента
-        sinceTs = assignedTs;
-      } else if (statusChangedTs < WIDGET_START_TS) {
-        // Лид попал в НЕ дозвонился ДО запуска виджета — пропускаем
+      // Лид попал в Недозвон ДО запуска виджета — пропускаем
+      if (statusChangedTs < WIDGET_START_TS) {
         console.log(`Сделка ${lead.id}: был в этапе до запуска виджета, пропуск`);
         continue;
-      } else {
-        // Лид попал в НЕ дозвонился после запуска виджета — считаем от status_changed_at
-        sinceTs = statusChangedTs;
       }
+
+      const sinceTs = statusChangedTs;
 
       const workingDays = getWorkingDaysBetween(sinceTs, nowTs);
       console.log(`Сделка ${lead.id} (${lead.name}): ${workingDays} рабочих дней`);
@@ -629,8 +623,7 @@ app.get('/api/preview', async (req, res) => {
       // Только если ответственный в monitored
       if (!monitoredIds.has(lead.responsible_user_id)) continue;
 
-      const assignedTs = assignmentsMap.get(lead.id);
-      const sinceTs = assignedTs || statusChangedTs;
+      const sinceTs = statusChangedTs;
       const workingDays = getWorkingDaysBetween(sinceTs, nowTs);
       const responsible = monitoredMap[lead.responsible_user_id];
 
