@@ -701,5 +701,4 @@ app.post('/api/rollback', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Сервер на порту ${PORT} | DRY_RUN=${DRY_RUN}`);
-  setTimeout(checkLeads, 5000);
 });
