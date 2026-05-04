@@ -21,7 +21,7 @@ const GROUP_ID = 689470;
 const DRY_RUN = process.env.DRY_RUN !== 'false';
 
 // Лиды попавшие в НЕ дозвонился ДО этой даты — пропускаем
-const WIDGET_START_DATE = new Date('2026-04-23T00:00:00+03:00');
+const WIDGET_START_DATE = new Date('2026-04-15T00:00:00+03:00');
 const WIDGET_START_TS = Math.floor(WIDGET_START_DATE.getTime() / 1000);
 
 // ─── AmoCRM ───────────────────────────────────────────────────────────────────
@@ -597,6 +597,63 @@ app.post('/api/sync-users', async (req, res) => {
     res.json({ success: true, ...result });
   } catch (err) {
     console.error('Ошибка sync-users:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── Preview: показать лиды за 15–22 апреля без действий ─────────────────────
+
+app.get('/api/preview', async (req, res) => {
+  try {
+    const PREVIEW_FROM = new Date('2026-04-15T00:00:00+03:00');
+    const PREVIEW_TO   = new Date('2026-04-23T00:00:00+03:00');
+    const PREVIEW_FROM_TS = Math.floor(PREVIEW_FROM.getTime() / 1000);
+    const PREVIEW_TO_TS   = Math.floor(PREVIEW_TO.getTime()   / 1000);
+
+    const { monitored, distribute } = await getQueueData();
+    const monitoredIds = new Set(monitored.map(u => u.id));
+    const monitoredMap = Object.fromEntries(monitored.map(u => [u.id, u]));
+
+    const leads = await getLeadsInStage();
+    const { tsMap: assignmentsMap } = await getAssignmentsMap();
+    const nowTs = Math.floor(Date.now() / 1000);
+
+    const result = [];
+
+    for (const lead of leads) {
+      const statusChangedTs = lead.status_changed_at || lead.created_at;
+
+      // Только лиды попавшие в этап между 15 и 23 апреля
+      if (statusChangedTs < PREVIEW_FROM_TS || statusChangedTs >= PREVIEW_TO_TS) continue;
+
+      // Только если ответственный в monitored
+      if (!monitoredIds.has(lead.responsible_user_id)) continue;
+
+      const assignedTs = assignmentsMap.get(lead.id);
+      const sinceTs = assignedTs || statusChangedTs;
+      const workingDays = getWorkingDaysBetween(sinceTs, nowTs);
+      const responsible = monitoredMap[lead.responsible_user_id];
+
+      result.push({
+        id: lead.id,
+        name: lead.name || '(без названия)',
+        responsible: responsible?.name || lead.responsible_user_id,
+        statusChangedAt: new Date(statusChangedTs * 1000).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' }),
+        workingDays,
+        action: workingDays >= 5 ? '🔄 Переназначение' : workingDays >= 3 ? '📋 Задача' : '⏳ Ждём'
+      });
+    }
+
+    result.sort((a, b) => b.workingDays - a.workingDays);
+
+    res.json({
+      success: true,
+      total: result.length,
+      monitored: monitored.map(u => u.name),
+      distribute: distribute.map(u => u.name),
+      leads: result
+    });
+  } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
