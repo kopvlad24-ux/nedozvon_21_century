@@ -338,6 +338,40 @@ function pickNextUser(distribute, lastAssignedId, currentResponsibleId, leadHist
   return distribute[0];
 }
 
+
+// ─── История ответственных по сделке из AMO ───────────────────────────────────
+
+async function getLeadResponsibleHistory(leadId) {
+  try {
+    const userIds = new Set();
+    let page = 1;
+    while (true) {
+      const { data } = await amo.get('/events', {
+        params: {
+          'filter[entity_type]': 'leads',
+          'filter[entity_id]': leadId,
+          'filter[type]': 'lead_responsible_user_changed',
+          limit: 100,
+          page
+        }
+      });
+      const events = data._embedded?.events || [];
+      for (const e of events) {
+        const before = e.value_before?.[0]?.responsible_user?.id;
+        const after = e.value_after?.[0]?.responsible_user?.id;
+        if (before) userIds.add(before);
+        if (after) userIds.add(after);
+      }
+      if (events.length < 100) break;
+      page++;
+    }
+    return userIds;
+  } catch (e) {
+    console.warn(`Не удалось получить историю ответственных для ${leadId}: ${e.message}`);
+    return new Set();
+  }
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function getWorkingDaysBetween(startTs, endTs) {
@@ -518,20 +552,22 @@ async function checkLeads() {
       if (workingDays >= 5) {
         const fromUser = monitoredMap[responsibleId];
 
-        // Проверяем прошёл ли лид через всех сотрудников группы
-        const allGroupIds = await getGroupUserIds();
-        // Добавляем текущего ответственного в историю для проверки
-        const fullHistory = leadHistory ? new Set([...leadHistory, responsibleId]) : new Set([responsibleId]);
-        const allVisited = [...allGroupIds].every(id => fullHistory.has(id));
+        // Берём полную историю ответственных по сделке из AMO (включая ручные назначения)
+        const amoHistory = await getLeadResponsibleHistory(lead.id);
+        // Добавляем текущего ответственного
+        amoHistory.add(responsibleId);
 
-        if (allVisited) {
-          // Все были — архив
-          await archiveLead(lead);
+        // Фильтруем distribute — только те кто ещё не был ответственным
+        const candidates = distribute.filter(u => !amoHistory.has(u.id));
+
+        if (!candidates.length) {
+          // Все из distribute уже были — архив
+          await archiveLead(lead, fromUser);
           await writeLog(lead.id, lead.name, fromUser.name, '~ Архив');
           statsUpdated = true;
         } else {
-          // Есть ещё кандидаты — переназначаем
-          const nextUser = pickNextUser(distribute, currentLastAssignedId, responsibleId, leadHistory);
+          // Есть кандидаты — переназначаем следующему по очереди
+          const nextUser = pickNextUser(candidates, currentLastAssignedId, responsibleId, null);
           await reassignAndMove(lead, fromUser, nextUser);
           await setLastAssignedId(nextUser.id);
           currentLastAssignedId = nextUser.id;
