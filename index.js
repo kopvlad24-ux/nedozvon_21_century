@@ -348,9 +348,9 @@ async function getLeadResponsibleHistory(leadId) {
     while (true) {
       const { data } = await amo.get('/events', {
         params: {
-          'filter[entity_type]': 'leads',
-          'filter[entity_id]': leadId,
-          'filter[type]': 'lead_responsible_user_changed',
+          'filter[entity][0][id]': leadId,
+          'filter[entity][0][type]': 'lead',
+          'filter[type][0]': 'lead_responsible_user_changed',
           limit: 100,
           page
         }
@@ -368,6 +368,7 @@ async function getLeadResponsibleHistory(leadId) {
     return userIds;
   } catch (e) {
     console.warn(`Не удалось получить историю ответственных для ${leadId}: ${e.message}`);
+    if (e.response) console.warn('AMO ответ:', JSON.stringify(e.response.data));
     return new Set();
   }
 }
