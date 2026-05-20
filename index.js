@@ -17,8 +17,10 @@ const STAGE_NEDOZVON = 82141390;
 const STAGE_NEW = 82141386;
 const STAGE_ARCHIVE = 143;
 const GROUP_ID = 689470;
-// AmoCRM ID сотрудника (РОП), на которого ставится задача «Передать» как сигнал боту
+// AmoCRM ID сотрудника (РОП), на которого ставится задача «Назначить агента» как сигнал боту
 const TRANSFER_RECIPIENT_ID = process.env.TRANSFER_RECIPIENT_ID ? parseInt(process.env.TRANSFER_RECIPIENT_ID) : null;
+// task_type_id задачи «Назначить агента» в AmoCRM (4101302 — из отладки)
+const TRANSFER_TASK_TYPE_ID = process.env.TRANSFER_TASK_TYPE_ID ? parseInt(process.env.TRANSFER_TASK_TYPE_ID) : 4101302;
 
 const DRY_RUN = process.env.DRY_RUN !== 'false';
 
@@ -617,7 +619,7 @@ async function checkLeads() {
         const allTasks = await getExistingTasks(lead.id);
         const transferTask = allTasks.find(t =>
           t.responsible_user_id === TRANSFER_RECIPIENT_ID &&
-          t.text?.toLowerCase().includes('назначить агента') &&
+          t.task_type_id === TRANSFER_TASK_TYPE_ID &&
           !t.is_completed
         );
         if (transferTask) {
