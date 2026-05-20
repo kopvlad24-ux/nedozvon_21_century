@@ -356,13 +356,13 @@ async function getLeadResponsibleHistory(leadId) {
         params: {
           'filter[entity][0][id]': leadId,
           'filter[entity][0][type]': 'lead',
-          'filter[type][0]': 'lead_responsible_user_changed',
           limit: 100,
           page
         }
       });
       const events = data._embedded?.events || [];
       for (const e of events) {
+        if (e.type !== 'lead_responsible_user_changed') continue;
         const before = e.value_before?.[0]?.responsible_user?.id;
         const after = e.value_after?.[0]?.responsible_user?.id;
         if (before) userIds.add(before);
@@ -628,9 +628,14 @@ async function checkLeads() {
           const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId);
           if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
           if (!DRY_RUN) {
-            await amo.patch('/tasks', [{ id: transferTask.id, is_completed: true }]);
+            try {
+              await amo.patch(`/tasks/${transferTask.id}`, { is_completed: true, result: { text: 'Выполнено ботом' } });
+              console.log(`Задача ${transferTask.id} закрыта`);
+            } catch (e) {
+              console.warn(`Не удалось закрыть задачу ${transferTask.id}: ${e.message}`, e.response?.data);
+            }
           } else {
-            console.log(`[DRY_RUN] Закрываем задачу "Передать" ${transferTask.id}`);
+            console.log(`[DRY_RUN] Закрываем задачу "Назначить агента" ${transferTask.id}`);
           }
           statsUpdated = true;
           continue;
