@@ -17,6 +17,8 @@ const STAGE_NEDOZVON = 82141390;
 const STAGE_NEW = 82141386;
 const STAGE_ARCHIVE = 143;
 const GROUP_ID = 689470;
+// AmoCRM ID сотрудника (РОП), на которого ставится задача «Передать» как сигнал боту
+const TRANSFER_RECIPIENT_ID = process.env.TRANSFER_RECIPIENT_ID ? parseInt(process.env.TRANSFER_RECIPIENT_ID) : null;
 
 const DRY_RUN = process.env.DRY_RUN !== 'false';
 
@@ -108,11 +110,13 @@ async function getAssignmentsMap() {
     const rows = res.data.values || [];
     const tsMap = new Map();
     const historyMap = new Map();
+    const countMap = new Map(); // сколько раз виджет переназначал этот лид
     for (const row of rows) {
       const leadId = parseInt(row[0]);
       const userId = parseInt(row[1]);
       const ts = parseInt(row[2]);
       if (!leadId) continue;
+      countMap.set(leadId, (countMap.get(leadId) || 0) + 1);
       // Последняя дата назначения
       if (ts) {
         const existing = tsMap.get(leadId);
@@ -124,10 +128,10 @@ async function getAssignmentsMap() {
         historyMap.get(leadId).add(userId);
       }
     }
-    return { tsMap, historyMap };
+    return { tsMap, historyMap, countMap };
   } catch (e) {
     console.warn('Не удалось прочитать assignments:', e.message);
-    return { tsMap: new Map(), historyMap: new Map() };
+    return { tsMap: new Map(), historyMap: new Map(), countMap: new Map() };
   }
 }
 
@@ -375,15 +379,40 @@ async function getLeadResponsibleHistory(leadId) {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function getWorkingDaysBetween(startTs, endTs) {
+// ─── Производственный календарь России (isdayoff.ru) ─────────────────────────
+
+const calendarCache = {};
+
+async function getRussianCalendar(year) {
+  if (calendarCache[year]) return calendarCache[year];
+  try {
+    const res = await axios.get(`https://isdayoff.ru/api/getdata?year=${year}&cc=ru`, { timeout: 5000 });
+    calendarCache[year] = res.data;
+    console.log(`Производственный календарь ${year} загружен (${res.data.length} дней)`);
+    return calendarCache[year];
+  } catch (e) {
+    console.warn(`Не удалось загрузить календарь ${year}: ${e.message}. Считаем только сб/вс.`);
+    return null;
+  }
+}
+
+async function getWorkingDaysBetween(startTs, endTs) {
   let count = 0;
   const cur = new Date(startTs * 1000);
   const end = new Date(endTs * 1000);
   cur.setHours(0, 0, 0, 0);
   end.setHours(0, 0, 0, 0);
   while (cur < end) {
-    const day = cur.getDay();
-    if (day !== 0 && day !== 6) count++;
+    const year = cur.getFullYear();
+    const calendar = await getRussianCalendar(year);
+    if (calendar) {
+      const yearStart = new Date(year, 0, 1);
+      const dayIndex = Math.floor((cur - yearStart) / 86400000);
+      if (calendar[dayIndex] === '0') count++;
+    } else {
+      const day = cur.getDay();
+      if (day !== 0 && day !== 6) count++;
+    }
     cur.setDate(cur.getDate() + 1);
   }
   return count;
@@ -496,6 +525,37 @@ async function archiveLead(lead, fromUser) {
   console.log(`Сделка ${lead.id} → Архив`);
 }
 
+// ─── Перераспределение лида ───────────────────────────────────────────────────
+// Максимум 3 переназначения (4-й → архив).
+// Возвращает { newLastAssignedId } — обновлённый указатель очереди.
+
+async function performRedistribution(lead, fromUser, distribute, countMap, lastAssignedId) {
+  const redistributionCount = countMap.get(lead.id) || 0;
+
+  if (redistributionCount >= 3) {
+    console.log(`Сделка ${lead.id}: уже было ${redistributionCount} переназначений → Архив`);
+    await archiveLead(lead, fromUser);
+    await writeLog(lead.id, lead.name, fromUser.name, '~ Архив');
+    return { newLastAssignedId: null };
+  }
+
+  const amoHistory = await getLeadResponsibleHistory(lead.id);
+  amoHistory.add(fromUser.id);
+  const candidates = distribute.filter(u => !amoHistory.has(u.id));
+
+  if (!candidates.length) {
+    console.log(`Сделка ${lead.id}: все из очереди уже были → Архив`);
+    await archiveLead(lead, fromUser);
+    await writeLog(lead.id, lead.name, fromUser.name, '~ Архив');
+    return { newLastAssignedId: null };
+  }
+
+  const nextUser = pickNextUser(candidates, lastAssignedId, fromUser.id, null);
+  await reassignAndMove(lead, fromUser, nextUser);
+  await setLastAssignedId(nextUser.id);
+  return { newLastAssignedId: nextUser.id };
+}
+
 // ─── Основная проверка ────────────────────────────────────────────────────────
 
 async function checkLeads() {
@@ -516,7 +576,7 @@ async function checkLeads() {
       getLastAssignedId(),
       getAllQueueUserIds()
     ]);
-    const { tsMap: assignmentsMap, historyMap } = assignments;
+    const { tsMap: assignmentsMap, historyMap, countMap } = assignments;
     console.log(`Лидов в этапе НЕ дозвонился: ${leads.length}`);
     const nowTs = Math.floor(Date.now() / 1000);
     let statsUpdated = false;
@@ -547,33 +607,39 @@ async function checkLeads() {
 
       const sinceTs = statusChangedTs;
 
-      const workingDays = getWorkingDaysBetween(sinceTs, nowTs);
+      const workingDays = await getWorkingDaysBetween(sinceTs, nowTs);
       console.log(`Сделка ${lead.id} (${lead.name}): ${workingDays} рабочих дней`);
+
+      // Задача «Назначить агента»: немедленное переназначение по запросу менеджера.
+      // Сотрудник создаёт задачу с текстом «назначить агента» и назначает её на РОП (TRANSFER_RECIPIENT_ID).
+      // РОП всегда FALSE в таблице — он только «почтовый ящик» для сигнала.
+      if (TRANSFER_RECIPIENT_ID) {
+        const allTasks = await getExistingTasks(lead.id);
+        const transferTask = allTasks.find(t =>
+          t.responsible_user_id === TRANSFER_RECIPIENT_ID &&
+          t.text?.toLowerCase().includes('назначить агента') &&
+          !t.is_completed
+        );
+        if (transferTask) {
+          console.log(`Сделка ${lead.id}: задача "Назначить агента" (id=${transferTask.id}) → немедленное переназначение`);
+          const fromUser = monitoredMap[responsibleId];
+          const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId);
+          if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
+          if (!DRY_RUN) {
+            await amo.patch('/tasks', [{ id: transferTask.id, is_completed: true }]);
+          } else {
+            console.log(`[DRY_RUN] Закрываем задачу "Передать" ${transferTask.id}`);
+          }
+          statsUpdated = true;
+          continue;
+        }
+      }
 
       if (workingDays >= 5) {
         const fromUser = monitoredMap[responsibleId];
-
-        // Берём полную историю ответственных по сделке из AMO (включая ручные назначения)
-        const amoHistory = await getLeadResponsibleHistory(lead.id);
-        // Добавляем текущего ответственного
-        amoHistory.add(responsibleId);
-
-        // Фильтруем distribute — только те кто ещё не был ответственным
-        const candidates = distribute.filter(u => !amoHistory.has(u.id));
-
-        if (!candidates.length) {
-          // Все из distribute уже были — архив
-          await archiveLead(lead, fromUser);
-          await writeLog(lead.id, lead.name, fromUser.name, '~ Архив');
-          statsUpdated = true;
-        } else {
-          // Есть кандидаты — переназначаем следующему по очереди
-          const nextUser = pickNextUser(candidates, currentLastAssignedId, responsibleId, null);
-          await reassignAndMove(lead, fromUser, nextUser);
-          await setLastAssignedId(nextUser.id);
-          currentLastAssignedId = nextUser.id;
-          statsUpdated = true;
-        }
+        const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId);
+        if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
+        statsUpdated = true;
         continue;
       }
 
@@ -603,7 +669,7 @@ async function checkLeads() {
 
 // ─── Cron: будни 12, 16, 19 МСК ──────────────────────────────────────────────
 
-cron.schedule('0 12,16,19 * * 1-5', checkLeads, { timezone: 'Europe/Moscow' });
+cron.schedule('0 15 * * 1-5', checkLeads, { timezone: 'Europe/Moscow' });
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
@@ -661,7 +727,7 @@ app.get('/api/preview', async (req, res) => {
       if (!monitoredIds.has(lead.responsible_user_id)) continue;
 
       const sinceTs = statusChangedTs;
-      const workingDays = getWorkingDaysBetween(sinceTs, nowTs);
+      const workingDays = await getWorkingDaysBetween(sinceTs, nowTs);
       const responsible = monitoredMap[lead.responsible_user_id];
 
       result.push({
