@@ -630,36 +630,6 @@ async function checkLeads() {
       const workingDays = await getWorkingDaysBetween(sinceTs, nowTs);
       console.log(`Сделка ${lead.id} (${lead.name}): ${workingDays} рабочих дней`);
 
-      // Задача «Назначить агента»: немедленное переназначение по запросу менеджера.
-      // Сотрудник создаёт задачу с текстом «назначить агента» и назначает её на РОП (TRANSFER_RECIPIENT_ID).
-      // РОП всегда FALSE в таблице — он только «почтовый ящик» для сигнала.
-      if (TRANSFER_RECIPIENT_ID) {
-        const allTasks = await getExistingTasks(lead.id);
-        const transferTask = allTasks.find(t =>
-          t.responsible_user_id === TRANSFER_RECIPIENT_ID &&
-          t.task_type_id === TRANSFER_TASK_TYPE_ID &&
-          !t.is_completed
-        );
-        if (transferTask) {
-          console.log(`Сделка ${lead.id}: задача "Назначить агента" (id=${transferTask.id}) → немедленное переназначение`);
-          const fromUser = monitoredMap[responsibleId];
-          const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId);
-          if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
-          if (!DRY_RUN) {
-            try {
-              await amo.patch(`/tasks/${transferTask.id}`, { is_completed: true, result: { text: 'Выполнено ботом' } });
-              console.log(`Задача ${transferTask.id} закрыта`);
-            } catch (e) {
-              console.warn(`Не удалось закрыть задачу ${transferTask.id}: ${e.message}`, e.response?.data);
-            }
-          } else {
-            console.log(`[DRY_RUN] Закрываем задачу "Назначить агента" ${transferTask.id}`);
-          }
-          statsUpdated = true;
-          continue;
-        }
-      }
-
       if (workingDays >= 5) {
         const fromUser = monitoredMap[responsibleId];
         const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId);
@@ -680,13 +650,11 @@ async function checkLeads() {
       }
     }
 
-    // Задачи "Назначить агента" в любом этапе воронки
+    // Задачи "Назначить агента" — работают в любом этапе и без ограничений по дате/ответственному
     if (TRANSFER_RECIPIENT_ID) {
-      const processedLeadIds = new Set(leads.map(l => l.id));
       const transferTasks = await getOpenTransferTasks();
       for (const task of transferTasks) {
         const leadId = task.entity_id;
-        if (processedLeadIds.has(leadId)) continue; // уже обработан в основном цикле
         try {
           const { data: lead } = await amo.get(`/leads/${leadId}`);
           if (lead.pipeline_id !== PIPELINE_ID) continue;
