@@ -667,13 +667,36 @@ async function checkLeads() {
   }
 }
 
-// ─── Cron: будни 12, 16, 19 МСК ──────────────────────────────────────────────
+// ─── Cron ─────────────────────────────────────────────────────────────────────
 
+// 9:00 МСК — синхронизация новых сотрудников из AmoCRM в таблицу
+cron.schedule('0 9 * * 1-5', syncUsers, { timezone: 'Europe/Moscow' });
+
+// 15:00 МСК — основная проверка лидов
 cron.schedule('0 15 * * 1-5', checkLeads, { timezone: 'Europe/Moscow' });
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({ status: 'ok', dry_run: DRY_RUN, time: new Date().toISOString() }));
+
+app.get('/api/debug-tasks/:leadId', async (req, res) => {
+  try {
+    const tasks = await getExistingTasks(parseInt(req.params.leadId));
+    res.json({
+      TRANSFER_RECIPIENT_ID,
+      taskCount: tasks.length,
+      tasks: tasks.map(t => ({
+        id: t.id,
+        text: t.text,
+        responsible_user_id: t.responsible_user_id,
+        is_completed: t.is_completed,
+        task_type_id: t.task_type_id
+      }))
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.post('/api/check', (req, res) => {
   checkLeads();
