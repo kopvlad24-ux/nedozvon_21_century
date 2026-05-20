@@ -650,34 +650,6 @@ async function checkLeads() {
       }
     }
 
-    // Задачи "Назначить агента" — работают в любом этапе и без ограничений по дате/ответственному
-    if (TRANSFER_RECIPIENT_ID) {
-      const transferTasks = await getOpenTransferTasks();
-      for (const task of transferTasks) {
-        const leadId = task.entity_id;
-        try {
-          const { data: lead } = await amo.get(`/leads/${leadId}`);
-          if (lead.pipeline_id !== PIPELINE_ID) continue;
-          const responsibleId = lead.responsible_user_id;
-          const fromUser = monitoredMap[responsibleId] || { id: responsibleId, name: `User ${responsibleId}` };
-          console.log(`Сделка ${lead.id} (${lead.name}): задача "Назначить агента" (этап ${lead.status_id}) → переназначение`);
-          const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId);
-          if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
-          if (!DRY_RUN) {
-            try {
-              await amo.patch(`/tasks/${task.id}`, { is_completed: true, result: { text: 'Выполнено ботом' } });
-              console.log(`Задача ${task.id} закрыта`);
-            } catch (e) {
-              console.warn(`Не удалось закрыть задачу ${task.id}: ${e.message}`);
-            }
-          }
-          statsUpdated = true;
-        } catch (e) {
-          console.warn(`Ошибка обработки задачи ${task.id} (лид ${leadId}): ${e.message}`);
-        }
-      }
-    }
-
     if (statsUpdated) await updateStats();
     console.log('Проверка завершена');
   } catch (err) {
@@ -690,13 +662,53 @@ async function checkLeads() {
   }
 }
 
+async function checkTransferTasks() {
+  if (!TRANSFER_RECIPIENT_ID) return;
+  console.log(`\n=== Передача заявок ${new Date().toISOString()} ===`);
+  try {
+    const { distribute } = await getQueueData();
+    if (!distribute.length) return;
+    const [assignments, lastAssignedId] = await Promise.all([getAssignmentsMap(), getLastAssignedId()]);
+    const { countMap } = assignments;
+    let currentLastAssignedId = lastAssignedId;
+    const transferTasks = await getOpenTransferTasks();
+    if (!transferTasks.length) { console.log('Задач "Назначить агента" нет'); return; }
+    for (const task of transferTasks) {
+      try {
+        const { data: lead } = await amo.get(`/leads/${task.entity_id}`);
+        if (lead.pipeline_id !== PIPELINE_ID) continue;
+        const responsibleId = lead.responsible_user_id;
+        const fromUser = { id: responsibleId, name: `User ${responsibleId}` };
+        console.log(`Сделка ${lead.id} (${lead.name}): задача "Назначить агента" → немедленное переназначение`);
+        const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId);
+        if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
+        if (!DRY_RUN) {
+          try {
+            await amo.patch(`/tasks/${task.id}`, { is_completed: true, result: { text: 'Выполнено ботом' } });
+            console.log(`Задача ${task.id} закрыта`);
+          } catch (e) {
+            console.warn(`Не удалось закрыть задачу ${task.id}: ${e.message}`);
+          }
+        }
+      } catch (e) {
+        console.warn(`Ошибка задачи ${task.id}: ${e.message}`);
+      }
+    }
+  } catch (err) {
+    console.error('Ошибка checkTransferTasks:', err.message);
+  }
+}
+
 // ─── Cron ─────────────────────────────────────────────────────────────────────
 
 // 9:00 МСК — синхронизация новых сотрудников из AmoCRM в таблицу
 cron.schedule('0 9 * * 1-5', syncUsers, { timezone: 'Europe/Moscow' });
 
-// 15:00 МСК — основная проверка лидов
+// 15:00 МСК — основная проверка лидов (Недозвон)
 cron.schedule('0 15 * * 1-5', checkLeads, { timezone: 'Europe/Moscow' });
+
+// каждые 5 минут — молниеносная передача по задаче "Назначить агента"
+cron.schedule('*/5 * * * *', checkTransferTasks);
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
