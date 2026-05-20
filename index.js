@@ -444,6 +444,24 @@ async function getLeadsInStage() {
   return leads;
 }
 
+async function getOpenTransferTasks() {
+  if (!TRANSFER_RECIPIENT_ID) return [];
+  try {
+    const { data } = await amo.get('/tasks', {
+      params: {
+        'filter[responsible_user_id]': TRANSFER_RECIPIENT_ID,
+        'filter[is_completed]': 0,
+        limit: 250
+      }
+    });
+    const tasks = data._embedded?.tasks || [];
+    return tasks.filter(t => t.task_type_id === TRANSFER_TASK_TYPE_ID);
+  } catch (e) {
+    console.warn('Не удалось получить задачи "Назначить агента":', e.message);
+    return [];
+  }
+}
+
 async function getExistingTasks(leadId) {
   try {
     const { data } = await amo.get('/tasks', {
@@ -658,6 +676,36 @@ async function checkLeads() {
             lead.id, responsibleId,
             `Не удается выйти на клиента уже ${workingDays} дня! Что планируешь делать?`
           );
+        }
+      }
+    }
+
+    // Задачи "Назначить агента" в любом этапе воронки
+    if (TRANSFER_RECIPIENT_ID) {
+      const processedLeadIds = new Set(leads.map(l => l.id));
+      const transferTasks = await getOpenTransferTasks();
+      for (const task of transferTasks) {
+        const leadId = task.entity_id;
+        if (processedLeadIds.has(leadId)) continue; // уже обработан в основном цикле
+        try {
+          const { data: lead } = await amo.get(`/leads/${leadId}`);
+          if (lead.pipeline_id !== PIPELINE_ID) continue;
+          const responsibleId = lead.responsible_user_id;
+          const fromUser = monitoredMap[responsibleId] || { id: responsibleId, name: `User ${responsibleId}` };
+          console.log(`Сделка ${lead.id} (${lead.name}): задача "Назначить агента" (этап ${lead.status_id}) → переназначение`);
+          const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId);
+          if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
+          if (!DRY_RUN) {
+            try {
+              await amo.patch(`/tasks/${task.id}`, { is_completed: true, result: { text: 'Выполнено ботом' } });
+              console.log(`Задача ${task.id} закрыта`);
+            } catch (e) {
+              console.warn(`Не удалось закрыть задачу ${task.id}: ${e.message}`);
+            }
+          }
+          statsUpdated = true;
+        } catch (e) {
+          console.warn(`Ошибка обработки задачи ${task.id} (лид ${leadId}): ${e.message}`);
         }
       }
     }
