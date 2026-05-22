@@ -354,8 +354,8 @@ async function getLeadResponsibleHistory(leadId) {
     while (true) {
       const { data } = await amo.get('/events', {
         params: {
-          'filter[entity][0][id]': leadId,
-          'filter[entity][0][type]': 'lead',
+          'filter[entity_id]': leadId,
+          'filter[entity_type]': 'lead',
           limit: 100,
           page
         }
@@ -498,21 +498,28 @@ async function reassignAndMove(lead, fromUser, nextUser) {
     pipeline_id: PIPELINE_ID
   }]);
 
-  // Меняем ответственного в контактах
-  try {
-    const { data: leadData } = await amo.get(`/leads/${lead.id}`, {
-      params: { with: 'contacts' }
-    });
-    const contacts = leadData._embedded?.contacts || [];
-    if (contacts.length) {
-      await amo.patch('/contacts', contacts.map(c => ({
-        id: c.id,
-        responsible_user_id: nextUser.id
-      })));
-      console.log(`Контакты переназначены (${contacts.length} шт.)`);
+  // Меняем ответственного в контактах (retry при socket hang up)
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const { data: leadData } = await amo.get(`/leads/${lead.id}`, {
+        params: { with: 'contacts' }
+      });
+      const contacts = leadData._embedded?.contacts || [];
+      if (contacts.length) {
+        await amo.patch('/contacts', contacts.map(c => ({
+          id: c.id,
+          responsible_user_id: nextUser.id
+        })));
+        console.log(`Контакты переназначены (${contacts.length} шт.)`);
+      }
+      break;
+    } catch (e) {
+      if (attempt < 3) {
+        await new Promise(r => setTimeout(r, 2000 * attempt));
+      } else {
+        console.warn(`Не удалось переназначить контакты ${lead.id}: ${e.message}`);
+      }
     }
-  } catch (e) {
-    console.warn(`Не удалось переназначить контакты ${lead.id}: ${e.message}`);
   }
 
   // Комментарий
@@ -664,6 +671,8 @@ async function checkLeads() {
 
 async function checkTransferTasks() {
   if (!TRANSFER_RECIPIENT_ID) return;
+  const moscowHour = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' })).getHours();
+  if (moscowHour >= 20 || moscowHour < 10) return;
   console.log(`\n=== Передача заявок ${new Date().toISOString()} ===`);
   try {
     const { distribute } = await getQueueData();
