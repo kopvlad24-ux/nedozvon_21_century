@@ -347,37 +347,6 @@ function pickNextUser(distribute, lastAssignedId, currentResponsibleId, leadHist
 
 // ─── История ответственных по сделке из AMO ───────────────────────────────────
 
-async function getLeadResponsibleHistory(leadId) {
-  try {
-    const userIds = new Set();
-    let page = 1;
-    while (true) {
-      const { data } = await amo.get('/events', {
-        params: {
-          'filter[entity_id]': leadId,
-          'filter[entity_type]': 'lead',
-          limit: 100,
-          page
-        }
-      });
-      const events = data._embedded?.events || [];
-      for (const e of events) {
-        if (e.type !== 'lead_responsible_user_changed') continue;
-        const before = e.value_before?.[0]?.responsible_user?.id;
-        const after = e.value_after?.[0]?.responsible_user?.id;
-        if (before) userIds.add(before);
-        if (after) userIds.add(after);
-      }
-      if (events.length < 100) break;
-      page++;
-    }
-    return userIds;
-  } catch (e) {
-    console.warn(`Не удалось получить историю ответственных для ${leadId}: ${e.message}`);
-    if (e.response) console.warn('AMO ответ:', JSON.stringify(e.response.data));
-    return new Set();
-  }
-}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -556,7 +525,7 @@ async function archiveLead(lead, fromUser) {
 // Максимум 3 переназначения (4-й → архив).
 // Возвращает { newLastAssignedId } — обновлённый указатель очереди.
 
-async function performRedistribution(lead, fromUser, distribute, countMap, lastAssignedId) {
+async function performRedistribution(lead, fromUser, distribute, countMap, lastAssignedId, historyMap) {
   const redistributionCount = countMap.get(lead.id) || 0;
 
   if (redistributionCount >= 3) {
@@ -566,9 +535,12 @@ async function performRedistribution(lead, fromUser, distribute, countMap, lastA
     return { newLastAssignedId: null };
   }
 
-  const amoHistory = await getLeadResponsibleHistory(lead.id);
-  amoHistory.add(fromUser.id);
-  const candidates = distribute.filter(u => !amoHistory.has(u.id));
+  // Используем историю из Google Sheets — AMO Events API не поддерживает нужный фильтр
+  const sheetHistory = historyMap?.get(lead.id) || new Set();
+  const history = new Set([...sheetHistory]);
+  history.add(fromUser.id);
+  console.log(`Сделка ${lead.id}: история ответственных (${history.size}): [${[...history].join(', ')}]`);
+  const candidates = distribute.filter(u => !history.has(u.id));
 
   if (!candidates.length) {
     console.log(`Сделка ${lead.id}: все из очереди уже были → Архив`);
@@ -639,7 +611,7 @@ async function checkLeads() {
 
       if (workingDays >= 5) {
         const fromUser = monitoredMap[responsibleId];
-        const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId);
+        const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId, historyMap);
         if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
         statsUpdated = true;
         continue;
@@ -678,7 +650,7 @@ async function checkTransferTasks() {
     const { distribute } = await getQueueData();
     if (!distribute.length) return;
     const [assignments, lastAssignedId] = await Promise.all([getAssignmentsMap(), getLastAssignedId()]);
-    const { countMap } = assignments;
+    const { countMap, historyMap } = assignments;
     let currentLastAssignedId = lastAssignedId;
     const transferTasks = await getOpenTransferTasks();
     if (!transferTasks.length) { console.log('Задач "Назначить агента" нет'); return; }
@@ -689,7 +661,7 @@ async function checkTransferTasks() {
         const responsibleId = lead.responsible_user_id;
         const fromUser = { id: responsibleId, name: `User ${responsibleId}` };
         console.log(`Сделка ${lead.id} (${lead.name}): задача "Назначить агента" → немедленное переназначение`);
-        const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId);
+        const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId, historyMap);
         if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
         if (!DRY_RUN) {
           try {
