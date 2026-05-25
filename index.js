@@ -166,16 +166,16 @@ async function writeAssignment(leadId, userId, userName) {
 
 // ─── Лог и статистика ─────────────────────────────────────────────────────────
 
-async function writeLog(leadId, leadName, fromName, toName) {
-  if (DRY_RUN) { console.log(`[DRY_RUN] Лог: ${leadId} от ${fromName} → ${toName}`); return; }
+async function writeLog(leadId, leadName, fromName, toName, reason = '') {
+  if (DRY_RUN) { console.log(`[DRY_RUN] Лог: ${leadId} от ${fromName} → ${toName} [${reason}]`); return; }
   const sheets = getSheetsClient();
   const now = new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' });
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
-    range: 'log!A:E',
+    range: 'log!A:F',
     valueInputOption: 'RAW',
     insertDataOption: 'INSERT_ROWS',
-    requestBody: { values: [[now, leadId, leadName || '', fromName, toName]] }
+    requestBody: { values: [[now, leadId, leadName || '', fromName, toName, reason]] }
   });
 }
 
@@ -201,7 +201,7 @@ async function updateStats() {
 
   const logRes = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range: 'log!A2:E10000'
+    range: 'log!A2:F10000'
   });
   const rows = logRes.data.values || [];
   if (!rows.length) return;
@@ -211,7 +211,7 @@ async function updateStats() {
   const weekStart = getWeekStart();
 
   function add(map, name, key) {
-    if (!map[name]) map[name] = { received: 0, taken: 0 };
+    if (!map[name]) map[name] = { received: 0, taken: 0, manual: 0, auto5: 0 };
     map[name][key]++;
   }
 
@@ -219,28 +219,32 @@ async function updateStats() {
   const allMonthStats = {};
 
   for (const row of rows) {
-    const [dateStr, , , fromName, toName] = row;
+    const [dateStr, , , fromName, toName, reason] = row;
     if (!dateStr || !fromName || !toName) continue;
     let date;
     try { date = parseRuDate(dateStr); } catch { continue; }
 
     if (date >= weekStart) {
       add(weekStats, fromName, 'taken');
-      add(weekStats, toName, 'received');
+      if (toName !== '~ Архив') add(weekStats, toName, 'received');
+      if (reason === 'назначить агента') add(weekStats, fromName, 'manual');
+      if (reason === '5 дней') add(weekStats, fromName, 'auto5');
     }
 
     const monthKey = `${MONTHS_RU[date.getMonth()]} ${date.getFullYear()}`;
     if (!allMonthStats[monthKey]) allMonthStats[monthKey] = {};
     add(allMonthStats[monthKey], fromName, 'taken');
-    add(allMonthStats[monthKey], toName, 'received');
+    if (toName !== '~ Архив') add(allMonthStats[monthKey], toName, 'received');
+    if (reason === 'назначить агента') add(allMonthStats[monthKey], fromName, 'manual');
+    if (reason === '5 дней') add(allMonthStats[monthKey], fromName, 'auto5');
   }
 
   // Неделя
-  const weekRows = [['Сотрудник', 'Получено лидов', 'Снято лидов']];
+  const weekRows = [['Сотрудник', 'Получено лидов', 'Снято лидов', 'Передал вручную', 'Задержал (5 дней)']];
   for (const [name, s] of Object.entries(weekStats)) {
-    weekRows.push([name, s.received, s.taken]);
+    weekRows.push([name, s.received || 0, s.taken || 0, s.manual || 0, s.auto5 || 0]);
   }
-  await sheets.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'week!A:C' });
+  await sheets.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'week!A:E' });
   await sheets.spreadsheets.values.update({
     spreadsheetId: SHEET_ID, range: 'week!A1',
     valueInputOption: 'RAW', requestBody: { values: weekRows }
@@ -254,14 +258,14 @@ async function updateStats() {
     return (MONTHS_RU.indexOf(mA) + parseInt(yA) * 12) - (MONTHS_RU.indexOf(mB) + parseInt(yB) * 12);
   });
   for (const monthKey of sortedMonths) {
-    monthRows.push([monthKey, '', '']);
-    monthRows.push(['Сотрудник', 'Получено лидов', 'Снято лидов']);
+    monthRows.push([monthKey, '', '', '', '']);
+    monthRows.push(['Сотрудник', 'Получено лидов', 'Снято лидов', 'Передал вручную', 'Задержал (5 дней)']);
     for (const [name, s] of Object.entries(allMonthStats[monthKey])) {
-      monthRows.push([name, s.received, s.taken]);
+      monthRows.push([name, s.received || 0, s.taken || 0, s.manual || 0, s.auto5 || 0]);
     }
-    monthRows.push(['', '', '']);
+    monthRows.push(['', '', '', '', '']);
   }
-  await sheets.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'month!A:C' });
+  await sheets.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: 'month!A:E' });
   if (monthRows.length) {
     await sheets.spreadsheets.values.update({
       spreadsheetId: SHEET_ID, range: 'month!A1',
@@ -482,9 +486,9 @@ async function createTask(leadId, responsibleUserId, text) {
   console.log(`Задача создана: ${leadId}`);
 }
 
-async function reassignAndMove(lead, fromUser, nextUser) {
+async function reassignAndMove(lead, fromUser, nextUser, reason = '') {
   if (DRY_RUN) {
-    console.log(`[DRY_RUN] Сделка ${lead.id} → ${nextUser.name}, этап → Новая заявка`);
+    console.log(`[DRY_RUN] Сделка ${lead.id} → ${nextUser.name}, этап → Новая заявка [${reason}]`);
     return;
   }
 
@@ -527,7 +531,7 @@ async function reassignAndMove(lead, fromUser, nextUser) {
     params: { text: `🔄 Лид передан по распределению → ${nextUser.name}` }
   }]);
 
-  await writeLog(lead.id, lead.name, fromUser.name, nextUser.name);
+  await writeLog(lead.id, lead.name, fromUser.name, nextUser.name, reason);
   await writeAssignment(lead.id, nextUser.id, nextUser.name);
   console.log(`Сделка ${lead.id} → ${nextUser.name} | Новая заявка`);
 }
@@ -554,13 +558,13 @@ async function archiveLead(lead, fromUser) {
 // Максимум 3 переназначения (4-й → архив).
 // Возвращает { newLastAssignedId } — обновлённый указатель очереди.
 
-async function performRedistribution(lead, fromUser, distribute, countMap, lastAssignedId, historyMap) {
+async function performRedistribution(lead, fromUser, distribute, countMap, lastAssignedId, historyMap, reason = '') {
   const redistributionCount = countMap.get(lead.id) || 0;
 
   if (redistributionCount >= 3) {
     console.log(`Сделка ${lead.id}: уже было ${redistributionCount} переназначений → Архив`);
     await archiveLead(lead, fromUser);
-    await writeLog(lead.id, lead.name, fromUser.name, '~ Архив');
+    await writeLog(lead.id, lead.name, fromUser.name, '~ Архив', reason);
     return { newLastAssignedId: null };
   }
 
@@ -574,12 +578,12 @@ async function performRedistribution(lead, fromUser, distribute, countMap, lastA
   if (!candidates.length) {
     console.log(`Сделка ${lead.id}: все из очереди уже были → Архив`);
     await archiveLead(lead, fromUser);
-    await writeLog(lead.id, lead.name, fromUser.name, '~ Архив');
+    await writeLog(lead.id, lead.name, fromUser.name, '~ Архив', reason);
     return { newLastAssignedId: null };
   }
 
   const nextUser = pickNextUser(candidates, lastAssignedId, fromUser.id, null);
-  await reassignAndMove(lead, fromUser, nextUser);
+  await reassignAndMove(lead, fromUser, nextUser, reason);
   await setLastAssignedId(nextUser.id);
   return { newLastAssignedId: nextUser.id };
 }
@@ -640,7 +644,7 @@ async function checkLeads() {
 
       if (workingDays >= 5) {
         const fromUser = monitoredMap[responsibleId];
-        const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId, historyMap);
+        const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId, historyMap, '5 дней');
         if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
         statsUpdated = true;
         continue;
@@ -691,7 +695,7 @@ async function checkTransferTasks() {
         const responsibleId = lead.responsible_user_id;
         const fromUser = { id: responsibleId, name: userNameMap.get(responsibleId) || `User ${responsibleId}` };
         console.log(`Сделка ${lead.id} (${lead.name}): задача "Назначить агента" → немедленное переназначение`);
-        const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId, historyMap);
+        const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId, historyMap, 'назначить агента');
         if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
         if (!DRY_RUN) {
           try {
@@ -734,7 +738,7 @@ app.post('/api/fix-log-names', async (req, res) => {
     if (req.body?.extra) {
       for (const [id, name] of Object.entries(req.body.extra)) nameMap.set(parseInt(id), name);
     }
-    const logRes = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: 'log!A2:E5000' });
+    const logRes = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: 'log!A2:F5000' });
     const rows = logRes.data.values || [];
     let fixed = 0;
     const updated = rows.map((row, i) => {
