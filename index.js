@@ -712,8 +712,8 @@ async function checkTransferTasks() {
 
 // ─── Cron ─────────────────────────────────────────────────────────────────────
 
-// 9:00 МСК — синхронизация новых сотрудников из AmoCRM в таблицу
-cron.schedule('0 9 * * 1-5', syncUsers, { timezone: 'Europe/Moscow' });
+// каждые 2 часа в рабочее время — синхронизация новых сотрудников из AmoCRM в таблицу
+cron.schedule('0 9,11,13,15,17 * * 1-5', syncUsers, { timezone: 'Europe/Moscow' });
 
 // 15:00 МСК — основная проверка лидов (Недозвон)
 cron.schedule('0 15 * * 1-5', checkLeads, { timezone: 'Europe/Moscow' });
