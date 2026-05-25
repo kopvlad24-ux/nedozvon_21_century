@@ -55,13 +55,16 @@ async function getQueueData() {
     range: 'queue!A2:D100'
   });
   const rows = res.data.values || [];
+  const allQueueUsers = rows
+    .filter(r => r[0] && r[1])
+    .map(r => ({ id: parseInt(r[0]), name: r[1] }));
   const monitored = rows
     .filter(r => r[2] && TRUTHY.includes(r[2].toString().toUpperCase()))
     .map(r => ({ id: parseInt(r[0]), name: r[1] }));
   const distribute = rows
     .filter(r => r[3] && TRUTHY.includes(r[3].toString().toUpperCase()))
     .map(r => ({ id: parseInt(r[0]), name: r[1] }));
-  return { monitored, distribute };
+  return { monitored, distribute, allQueueUsers };
 }
 
 // Все сотрудники из листа queue (независимо от active/distribute)
@@ -285,10 +288,29 @@ async function syncUsers() {
       valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS',
       requestBody: { values: newRows }
     });
-    console.log(`Добавлено: ${newRows.map(r => r[1]).join(', ')}`);
+    console.log(`Добавлено в queue: ${newRows.map(r => r[1]).join(', ')}`);
   } else {
     console.log('Новых сотрудников нет');
   }
+
+  // Синхронизируем сотрудники — все из queue кто ещё не там
+  const allQueueRows = (queueRes.data.values || []).concat(newRows.map(r => [r[0], r[1]]));
+  const empRes = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID, range: 'сотрудники!A2:B100'
+  });
+  const existingEmpIds = new Set((empRes.data.values || []).map(r => parseInt(r[0])));
+  const newEmpRows = allQueueRows
+    .filter(r => r[0] && r[1] && !existingEmpIds.has(parseInt(r[0])))
+    .map(r => [parseInt(r[0]), r[1]]);
+  if (newEmpRows.length) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID, range: 'сотрудники!A2',
+      valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: newEmpRows }
+    });
+    console.log(`Добавлено в сотрудники: ${newEmpRows.map(r => r[1]).join(', ')}`);
+  }
+
   return { added: newRows.length, users: newRows.map(r => ({ id: r[0], name: r[1] })) };
 }
 
@@ -647,8 +669,9 @@ async function checkTransferTasks() {
   if (moscowHour >= 20 || moscowHour < 10) return;
   console.log(`\n=== Передача заявок ${new Date().toISOString()} ===`);
   try {
-    const { distribute } = await getQueueData();
+    const { distribute, allQueueUsers } = await getQueueData();
     if (!distribute.length) return;
+    const userNameMap = new Map(allQueueUsers.map(u => [u.id, u.name]));
     const [assignments, lastAssignedId] = await Promise.all([getAssignmentsMap(), getLastAssignedId()]);
     const { countMap, historyMap } = assignments;
     let currentLastAssignedId = lastAssignedId;
@@ -659,7 +682,7 @@ async function checkTransferTasks() {
         const { data: lead } = await amo.get(`/leads/${task.entity_id}`);
         if (lead.pipeline_id !== PIPELINE_ID) continue;
         const responsibleId = lead.responsible_user_id;
-        const fromUser = { id: responsibleId, name: `User ${responsibleId}` };
+        const fromUser = { id: responsibleId, name: userNameMap.get(responsibleId) || `User ${responsibleId}` };
         console.log(`Сделка ${lead.id} (${lead.name}): задача "Назначить агента" → немедленное переназначение`);
         const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId, historyMap);
         if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
@@ -694,6 +717,44 @@ cron.schedule('*/5 * * * *', checkTransferTasks);
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({ status: 'ok', dry_run: DRY_RUN, time: new Date().toISOString() }));
+
+app.post('/api/fix-log-names', async (req, res) => {
+  try {
+    const sheets = getSheetsClient();
+    const { allQueueUsers } = await getQueueData();
+    const nameMap = new Map(allQueueUsers.map(u => [u.id, u.name]));
+    // Дополнительные известные ID не в queue
+    if (req.body?.extra) {
+      for (const [id, name] of Object.entries(req.body.extra)) nameMap.set(parseInt(id), name);
+    }
+    const logRes = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: 'log!A2:E5000' });
+    const rows = logRes.data.values || [];
+    let fixed = 0;
+    const updated = rows.map((row, i) => {
+      let changed = false;
+      const newRow = [...row];
+      for (const col of [3, 4]) {
+        const val = row[col];
+        if (val && val.startsWith('User ')) {
+          const id = parseInt(val.replace('User ', ''));
+          if (nameMap.has(id)) { newRow[col] = nameMap.get(id); changed = true; }
+        }
+      }
+      if (changed) fixed++;
+      return newRow;
+    });
+    if (fixed > 0) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID, range: 'log!A2',
+        valueInputOption: 'RAW', requestBody: { values: updated }
+      });
+      await updateStats();
+    }
+    res.json({ fixed, message: `Исправлено ${fixed} записей в логе` });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.get('/api/debug-tasks/:leadId', async (req, res) => {
   try {
