@@ -493,12 +493,18 @@ async function reassignAndMove(lead, fromUser, nextUser, reason = '') {
   }
 
   // Меняем ответственного; этап → "Новая заявка" только если лид сейчас в Недозвоне
-  const patchData = { id: lead.id, responsible_user_id: nextUser.id };
+  const patchData = { responsible_user_id: nextUser.id };
   if (lead.status_id === STAGE_NEDOZVON) {
     patchData.status_id = STAGE_NEW;
     patchData.pipeline_id = PIPELINE_ID;
   }
-  await amo.patch('/leads', [patchData]);
+  console.log(`Патч сделки ${lead.id}: status_id=${lead.status_id}, данные=${JSON.stringify(patchData)}`);
+  try {
+    await amo.patch(`/leads/${lead.id}`, patchData);
+  } catch (e) {
+    console.error(`Ошибка патча сделки ${lead.id}:`, JSON.stringify(e.response?.data));
+    throw e;
+  }
 
   // Меняем ответственного в контактах (retry при socket hang up)
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -705,7 +711,8 @@ async function checkTransferTasks() {
           redistributed = true; // успешно: либо передан агенту, либо отправлен в архив
           if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
         } catch (e) {
-          console.warn(`Сделка ${lead.id}: ошибка переназначения: ${e.message}`, e.response?.data);
+          console.warn(`Сделка ${lead.id}: ошибка переназначения: ${e.message}`);
+          if (e.response?.data) console.warn('Детали:', JSON.stringify(e.response.data));
         }
         // Закрываем задачу ТОЛЬКО если переназначение прошло успешно
         if (redistributed && !DRY_RUN) {
