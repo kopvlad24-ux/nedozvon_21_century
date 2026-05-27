@@ -691,12 +691,21 @@ async function checkTransferTasks() {
     for (const task of transferTasks) {
       try {
         const { data: lead } = await amo.get(`/leads/${task.entity_id}`);
-        if (lead.pipeline_id !== PIPELINE_ID) continue;
+        if (lead.pipeline_id !== PIPELINE_ID) {
+          console.log(`Задача ${task.id}: лид ${task.entity_id} не в нашей воронке, закрываем задачу`);
+          if (!DRY_RUN) await amo.patch(`/tasks/${task.id}`, { is_completed: true, result: { text: 'Лид не в воронке' } }).catch(() => {});
+          continue;
+        }
         const responsibleId = lead.responsible_user_id;
         const fromUser = { id: responsibleId, name: userNameMap.get(responsibleId) || `User ${responsibleId}` };
         console.log(`Сделка ${lead.id} (${lead.name}): задача "Назначить агента" → немедленное переназначение`);
-        const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId, historyMap, 'назначить агента');
-        if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
+        try {
+          const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId, historyMap, 'назначить агента');
+          if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
+        } catch (e) {
+          console.warn(`Сделка ${lead.id}: ошибка переназначения: ${e.message}`, e.response?.data);
+        }
+        // Закрываем задачу всегда — даже если переназначение упало
         if (!DRY_RUN) {
           try {
             await amo.patch(`/tasks/${task.id}`, { is_completed: true, result: { text: 'Выполнено ботом' } });
@@ -706,7 +715,7 @@ async function checkTransferTasks() {
           }
         }
       } catch (e) {
-        console.warn(`Ошибка задачи ${task.id}: ${e.message}`);
+        console.warn(`Ошибка задачи ${task.id}: ${e.message}`, e.response?.data);
       }
     }
   } catch (err) {
