@@ -579,7 +579,7 @@ async function performRedistribution(lead, fromUser, distribute, countMap, lastA
   const history = new Set([...sheetHistory]);
   history.add(fromUser.id);
   console.log(`Сделка ${lead.id}: история ответственных (${history.size}): [${[...history].join(', ')}]`);
-  const candidates = distribute.filter(u => !history.has(u.id));
+  let candidates = distribute.filter(u => !history.has(u.id));
 
   if (!candidates.length) {
     console.log(`Сделка ${lead.id}: все из очереди уже были → Архив`);
@@ -588,10 +588,30 @@ async function performRedistribution(lead, fromUser, distribute, countMap, lastA
     return { newLastAssignedId: null };
   }
 
-  const nextUser = pickNextUser(candidates, lastAssignedId, fromUser.id, null);
-  await reassignAndMove(lead, fromUser, nextUser, reason);
-  await setLastAssignedId(nextUser.id);
-  return { newLastAssignedId: nextUser.id };
+  // Перебираем кандидатов — пропускаем тех, кого AmoCRM не принимает (нет доступа к воронке)
+  while (candidates.length > 0) {
+    const nextUser = pickNextUser(candidates, lastAssignedId, fromUser.id, null);
+    try {
+      await reassignAndMove(lead, fromUser, nextUser, reason);
+      await setLastAssignedId(nextUser.id);
+      return { newLastAssignedId: nextUser.id };
+    } catch (e) {
+      const errors = e.response?.data?.['validation-errors']?.[0]?.errors || [];
+      const isInvalidUser = errors.some(err => err.path === 'responsible_user_id' && err.code === 'NotSupportedChoice');
+      if (isInvalidUser) {
+        console.warn(`Сотрудник ${nextUser.name} (${nextUser.id}) недоступен для назначения в AmoCRM — пропускаем, берём следующего`);
+        candidates = candidates.filter(u => u.id !== nextUser.id);
+      } else {
+        throw e; // другая ошибка — пробрасываем наверх
+      }
+    }
+  }
+
+  // Все кандидаты оказались недоступны
+  console.warn(`Сделка ${lead.id}: все кандидаты недоступны в AmoCRM → Архив`);
+  await archiveLead(lead, fromUser);
+  await writeLog(lead.id, lead.name, fromUser.name, '~ Архив', reason);
+  return { newLastAssignedId: null };
 }
 
 // ─── Основная проверка ────────────────────────────────────────────────────────
