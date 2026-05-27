@@ -457,7 +457,7 @@ async function getOpenTransferTasks() {
       }
     });
     const tasks = data._embedded?.tasks || [];
-    return tasks.filter(t => t.task_type_id === TRANSFER_TASK_TYPE_ID);
+    return tasks.filter(t => t.task_type_id === TRANSFER_TASK_TYPE_ID && t.entity_type === 'leads');
   } catch (e) {
     console.warn('Не удалось получить задачи "Назначить агента":', e.message);
     return [];
@@ -492,13 +492,13 @@ async function reassignAndMove(lead, fromUser, nextUser, reason = '') {
     return;
   }
 
-  // Меняем ответственного и этап в сделке
-  await amo.patch('/leads', [{
-    id: lead.id,
-    responsible_user_id: nextUser.id,
-    status_id: STAGE_NEW,
-    pipeline_id: PIPELINE_ID
-  }]);
+  // Меняем ответственного; этап → "Новая заявка" только если лид сейчас в Недозвоне
+  const patchData = { id: lead.id, responsible_user_id: nextUser.id };
+  if (lead.status_id === STAGE_NEDOZVON) {
+    patchData.status_id = STAGE_NEW;
+    patchData.pipeline_id = PIPELINE_ID;
+  }
+  await amo.patch('/leads', [patchData]);
 
   // Меняем ответственного в контактах (retry при socket hang up)
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -699,20 +699,24 @@ async function checkTransferTasks() {
         const responsibleId = lead.responsible_user_id;
         const fromUser = { id: responsibleId, name: userNameMap.get(responsibleId) || `User ${responsibleId}` };
         console.log(`Сделка ${lead.id} (${lead.name}): задача "Назначить агента" → немедленное переназначение`);
+        let redistributed = false;
         try {
           const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId, historyMap, 'назначить агента');
+          redistributed = true; // успешно: либо передан агенту, либо отправлен в архив
           if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
         } catch (e) {
           console.warn(`Сделка ${lead.id}: ошибка переназначения: ${e.message}`, e.response?.data);
         }
-        // Закрываем задачу всегда — даже если переназначение упало
-        if (!DRY_RUN) {
+        // Закрываем задачу ТОЛЬКО если переназначение прошло успешно
+        if (redistributed && !DRY_RUN) {
           try {
             await amo.patch(`/tasks/${task.id}`, { is_completed: true, result: { text: 'Выполнено ботом' } });
             console.log(`Задача ${task.id} закрыта`);
           } catch (e) {
             console.warn(`Не удалось закрыть задачу ${task.id}: ${e.message}`);
           }
+        } else if (!redistributed) {
+          console.warn(`Задача ${task.id}: переназначение не выполнено — задача остаётся открытой`);
         }
       } catch (e) {
         console.warn(`Ошибка задачи ${task.id}: ${e.message}`, e.response?.data);
