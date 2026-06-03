@@ -344,11 +344,10 @@ async function archiveLead(lead) {
     console.log(`[DRY_RUN] Сделка ${lead.id} → Архив (прошла по всем сотрудникам группы)`);
     return;
   }
-  await amo.patch('/leads', [{
-    id: lead.id,
+  await amo.patch(`/leads/${lead.id}`, {
     status_id: STAGE_ARCHIVE,
     pipeline_id: PIPELINE_ID
-  }]);
+  });
   await amo.post('/leads/notes', [{
     entity_id: lead.id,
     note_type: 'common',
@@ -547,11 +546,10 @@ async function archiveLead(lead, fromUser) {
     console.log(`[DRY_RUN] Сделка ${lead.id} → Архив (прошла по всем сотрудникам)`);
     return;
   }
-  await amo.patch('/leads', [{
-    id: lead.id,
+  await amo.patch(`/leads/${lead.id}`, {
     status_id: STAGE_ARCHIVE,
     pipeline_id: PIPELINE_ID
-  }]);
+  });
   await amo.post('/leads/notes', [{
     entity_id: lead.id,
     note_type: 'common',
