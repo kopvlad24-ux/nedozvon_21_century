@@ -117,7 +117,7 @@ async function getAssignmentsMap() {
   try {
     const res = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
-      range: 'assignments!A2:C10000'
+      range: 'assignments!A2:D10000'
     });
     const rows = res.data.values || [];
     const tsMap = new Map();
@@ -127,14 +127,18 @@ async function getAssignmentsMap() {
       const leadId = parseInt(row[0]);
       const userId = parseInt(row[1]);
       const ts = parseInt(row[2]);
+      const type = row[3] || 'assign'; // 'assign' = кому назначили, 'from' = от кого ушёл
       if (!leadId) continue;
-      countMap.set(leadId, (countMap.get(leadId) || 0) + 1);
+      // countMap считает только реальные переназначения, не записи "от кого ушёл"
+      if (type === 'assign') {
+        countMap.set(leadId, (countMap.get(leadId) || 0) + 1);
+      }
       // Последняя дата назначения
-      if (ts) {
+      if (ts && type === 'assign') {
         const existing = tsMap.get(leadId);
         if (!existing || ts > existing) tsMap.set(leadId, ts);
       }
-      // История ответственных
+      // История ответственных — все записи
       if (userId) {
         if (!historyMap.has(leadId)) historyMap.set(leadId, new Set());
         historyMap.get(leadId).add(userId);
@@ -147,20 +151,21 @@ async function getAssignmentsMap() {
   }
 }
 
-// Записываем новое назначение в assignments
-async function writeAssignment(leadId, userId, userName) {
+// Записываем назначение в assignments.
+// type='assign' — кому назначили (считается в countMap); type='from' — от кого ушёл (только история)
+async function writeAssignment(leadId, userId, userName, type = 'assign') {
   if (DRY_RUN) {
-    console.log(`[DRY_RUN] assignments: лид ${leadId} → ${userName}`);
+    console.log(`[DRY_RUN] assignments: лид ${leadId} ${type === 'from' ? 'от' : '→'} ${userName}`);
     return;
   }
   const sheets = getSheetsClient();
   const ts = Math.floor(Date.now() / 1000);
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
-    range: 'assignments!A:C',
+    range: 'assignments!A:D',
     valueInputOption: 'RAW',
     insertDataOption: 'INSERT_ROWS',
-    requestBody: { values: [[leadId, userId, ts]] }
+    requestBody: { values: [[leadId, userId, ts, type]] }
   });
 }
 
@@ -563,6 +568,13 @@ async function archiveLead(lead, fromUser) {
 // Возвращает { newLastAssignedId } — обновлённый указатель очереди.
 
 async function performRedistribution(lead, fromUser, distribute, countMap, lastAssignedId, historyMap, reason = '') {
+  // Записываем fromUser в историю (type='from') чтобы он не получил этот лид снова
+  if (!historyMap.get(lead.id)?.has(fromUser.id)) {
+    await writeAssignment(lead.id, fromUser.id, fromUser.name, 'from');
+    if (!historyMap.has(lead.id)) historyMap.set(lead.id, new Set());
+    historyMap.get(lead.id).add(fromUser.id);
+  }
+
   const redistributionCount = countMap.get(lead.id) || 0;
 
   if (redistributionCount >= 3) {
