@@ -626,9 +626,27 @@ async function performRedistribution(lead, fromUser, distribute, countMap, lastA
   return { newLastAssignedId: null };
 }
 
+// ─── Mutex — защита от параллельных запусков ─────────────────────────────────
+
+let checkLeadsRunning = false;
+let checkTransferRunning = false;
+
 // ─── Основная проверка ────────────────────────────────────────────────────────
 
 async function checkLeads() {
+  if (checkLeadsRunning) {
+    console.log('checkLeads уже выполняется — пропускаем параллельный запуск');
+    return;
+  }
+  checkLeadsRunning = true;
+  try {
+    await _checkLeads();
+  } finally {
+    checkLeadsRunning = false;
+  }
+}
+
+async function _checkLeads() {
   console.log(`\n=== Проверка ${new Date().toISOString()}${DRY_RUN ? ' [DRY_RUN]' : ''} ===`);
   try {
     const { monitored, distribute } = await getQueueData();
@@ -713,6 +731,19 @@ async function checkLeads() {
 }
 
 async function checkTransferTasks() {
+  if (checkTransferRunning) {
+    console.log('checkTransferTasks уже выполняется — пропускаем параллельный запуск');
+    return;
+  }
+  checkTransferRunning = true;
+  try {
+    await _checkTransferTasks();
+  } finally {
+    checkTransferRunning = false;
+  }
+}
+
+async function _checkTransferTasks() {
   if (!TRANSFER_RECIPIENT_ID) return;
   const moscowHour = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' })).getHours();
   if (moscowHour >= 20 || moscowHour < 10) return;
