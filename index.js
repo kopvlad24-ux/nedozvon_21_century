@@ -855,14 +855,21 @@ async function _checkTransferTasks() {
           console.warn(`Сделка ${lead.id}: ошибка переназначения: ${e.message}`);
           if (e.response?.data) console.warn('Детали:', JSON.stringify(e.response.data));
         }
-        // Закрываем задачу ТОЛЬКО если переназначение прошло успешно
+        // Закрываем задачу ТОЛЬКО если переназначение прошло успешно (retry при socket hang up)
         if (redistributed && !DRY_RUN) {
-          try {
-            await amo.patch(`/tasks/${task.id}`, { is_completed: true, result: { text: 'Выполнено ботом' } });
-            console.log(`Задача ${task.id} закрыта`);
-          } catch (e) {
-            console.warn(`Не удалось закрыть задачу ${task.id}: ${e.message}`);
+          let closed = false;
+          for (let attempt = 1; attempt <= 5; attempt++) {
+            try {
+              await amo.patch(`/tasks/${task.id}`, { is_completed: true, result: { text: 'Выполнено ботом' } });
+              console.log(`Задача ${task.id} закрыта`);
+              closed = true;
+              break;
+            } catch (e) {
+              console.warn(`Попытка ${attempt}/5 закрыть задачу ${task.id}: ${e.message}`);
+              if (attempt < 5) await new Promise(r => setTimeout(r, 2000 * attempt));
+            }
           }
+          if (!closed) console.error(`Задача ${task.id}: не удалось закрыть за 5 попыток — будет повторно обработана на следующем запуске`);
         } else if (!redistributed) {
           console.warn(`Задача ${task.id}: переназначение не выполнено — задача остаётся открытой`);
         }
