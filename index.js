@@ -450,6 +450,64 @@ async function getLeadsInStage() {
   return leads;
 }
 
+// Сканирует ВСЕ лиды воронки (все этапы) и записывает текущего ответственного
+// как 'from' в assignments если его там ещё нет. Гарантирует что человек не получит
+// лид повторно независимо от того в каком этапе он его вёл раньше.
+async function seedHistoryFromAllPipelineLeads(historyMap) {
+  let page = 1;
+  const toWrite = []; // [[leadId, userId, ts, 'from'], ...]
+  const ts = Math.floor(Date.now() / 1000);
+
+  while (true) {
+    let batch;
+    try {
+      const { data } = await amo.get('/leads', {
+        params: { 'filter[pipeline_id]': PIPELINE_ID, limit: 250, page }
+      });
+      batch = data._embedded?.leads || [];
+    } catch (e) {
+      console.warn('seedHistory: ошибка загрузки лидов стр.' + page + ':', e.message);
+      break;
+    }
+
+    for (const lead of batch) {
+      const uid = lead.responsible_user_id;
+      if (!uid) continue;
+      if (!historyMap.get(lead.id)?.has(uid)) {
+        if (!historyMap.has(lead.id)) historyMap.set(lead.id, new Set());
+        historyMap.get(lead.id).add(uid);
+        toWrite.push([lead.id, uid, ts, 'from']);
+      }
+    }
+
+    if (batch.length < 250) break;
+    page++;
+  }
+
+  if (toWrite.length === 0) {
+    console.log('seedHistory: все ответственные уже в истории');
+    return;
+  }
+
+  if (!DRY_RUN) {
+    try {
+      const sheets = getSheetsClient();
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: SHEET_ID,
+        range: 'assignments!A:D',
+        valueInputOption: 'RAW',
+        insertDataOption: 'INSERT_ROWS',
+        requestBody: { values: toWrite }
+      });
+      console.log(`seedHistory: зафиксировано ${toWrite.length} новых ответственных по всей воронке`);
+    } catch (e) {
+      console.warn('seedHistory: не удалось записать в Sheets:', e.message);
+    }
+  } else {
+    console.log(`[DRY_RUN] seedHistory: зафиксировал бы ${toWrite.length} ответственных`);
+  }
+}
+
 async function getOpenTransferTasks() {
   if (!TRANSFER_RECIPIENT_ID) return [];
   try {
@@ -665,6 +723,8 @@ async function _checkLeads() {
       getAllQueueUserIds()
     ]);
     const { tsMap: assignmentsMap, historyMap, countMap } = assignments;
+    // Фиксируем ответственных по всей воронке до обработки лидов
+    await seedHistoryFromAllPipelineLeads(historyMap);
     console.log(`Лидов в этапе НЕ дозвонился: ${leads.length}`);
     const nowTs = Math.floor(Date.now() / 1000);
     let statsUpdated = false;
@@ -764,6 +824,8 @@ async function _checkTransferTasks() {
     const userNameMap = new Map(allQueueUsers.map(u => [u.id, u.name]));
     const [assignments, lastAssignedId] = await Promise.all([getAssignmentsMap(), getLastAssignedId()]);
     const { countMap, historyMap } = assignments;
+    // Фиксируем ответственных по всей воронке до обработки задач
+    await seedHistoryFromAllPipelineLeads(historyMap);
     let currentLastAssignedId = lastAssignedId;
     const transferTasks = await getOpenTransferTasks();
     if (!transferTasks.length) { console.log('Задач "Назначить агента" нет'); return; }
