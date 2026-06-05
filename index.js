@@ -683,6 +683,16 @@ async function _checkLeads() {
         continue;
       }
 
+      // Фиксируем текущего ответственного в историю при первом же взгляде на лид.
+      // Это гарантирует что он не получит лид снова при последующих перераспределениях,
+      // даже если он был назначен вручную до начала работы бота.
+      if (!historyMap.get(lead.id)?.has(responsibleId)) {
+        await writeAssignment(lead.id, responsibleId, monitoredMap[responsibleId]?.name || `User ${responsibleId}`, 'from');
+        if (!historyMap.has(lead.id)) historyMap.set(lead.id, new Set());
+        historyMap.get(lead.id).add(responsibleId);
+        console.log(`Сделка ${lead.id}: зафиксирован текущий ответственный ${monitoredMap[responsibleId]?.name} в историю`);
+      }
+
       // Определяем точку отсчёта — всегда от момента попадания в этап Недозвон
       const leadHistory = historyMap.get(lead.id); // кто уже был ответственным (для исключения повторов)
       const statusChangedTs = lead.status_changed_at || lead.created_at;
@@ -767,6 +777,12 @@ async function _checkTransferTasks() {
         }
         const responsibleId = lead.responsible_user_id;
         const fromUser = { id: responsibleId, name: userNameMap.get(responsibleId) || `User ${responsibleId}` };
+        // Фиксируем текущего ответственного в историю до перераспределения
+        if (!historyMap.get(lead.id)?.has(responsibleId)) {
+          await writeAssignment(lead.id, responsibleId, fromUser.name, 'from');
+          if (!historyMap.has(lead.id)) historyMap.set(lead.id, new Set());
+          historyMap.get(lead.id).add(responsibleId);
+        }
         console.log(`Сделка ${lead.id} (${lead.name}): задача "Назначить агента" → немедленное переназначение`);
         let redistributed = false;
         try {
