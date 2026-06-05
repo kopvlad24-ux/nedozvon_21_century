@@ -496,9 +496,11 @@ async function reassignAndMove(lead, fromUser, nextUser, reason = '') {
     return;
   }
 
-  // Меняем ответственного; этап → "Новая заявка" только если лид сейчас в Недозвоне
+  // Меняем ответственного; этап → "Новая заявка":
+  // - всегда при ручном "Назначить агента" (reason)
+  // - при авто-5-дней только если лид сейчас в Недозвоне
   const patchData = { responsible_user_id: nextUser.id };
-  if (lead.status_id === STAGE_NEDOZVON) {
+  if (lead.status_id === STAGE_NEDOZVON || reason === 'назначить агента') {
     patchData.status_id = STAGE_NEW;
     patchData.pipeline_id = PIPELINE_ID;
   }
