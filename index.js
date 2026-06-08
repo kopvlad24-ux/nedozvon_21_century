@@ -893,6 +893,7 @@ async function _checkTransferTasks() {
         console.warn(`Ошибка задачи ${task.id}: ${e.message}`, e.response?.data);
       }
     }
+    await updateStats();
   } catch (err) {
     console.error('Ошибка checkTransferTasks:', err.message);
   }
