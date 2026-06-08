@@ -554,11 +554,10 @@ async function reassignAndMove(lead, fromUser, nextUser, reason = '') {
     return;
   }
 
-  // Меняем ответственного; этап → "Новая заявка":
-  // - всегда при ручном "Назначить агента" (reason)
-  // - при авто-5-дней только если лид сейчас в Недозвоне
+  // Меняем ответственного; этап → "Новая заявка" только если лид сейчас в Недозвоне
+  // (если агент уже переместил лид в другой этап — не трогаем)
   const patchData = { responsible_user_id: nextUser.id };
-  if (lead.status_id === STAGE_NEDOZVON || reason === 'назначить агента') {
+  if (lead.status_id === STAGE_NEDOZVON) {
     patchData.status_id = STAGE_NEW;
     patchData.pipeline_id = PIPELINE_ID;
   }
@@ -839,6 +838,23 @@ async function _checkTransferTasks() {
         }
         const responsibleId = lead.responsible_user_id;
         const fromUser = { id: responsibleId, name: userNameMap.get(responsibleId) || `User ${responsibleId}` };
+
+        // Если лид уже вышел из НЕ дозвонился — агент сам разобрался, задачу закрываем без переназначения
+        if (lead.status_id !== STAGE_NEDOZVON) {
+          console.log(`Задача ${task.id}: лид ${lead.id} уже не в Недозвоне (status=${lead.status_id}) — закрываем задачу без переназначения`);
+          if (!DRY_RUN) {
+            for (let attempt = 1; attempt <= 5; attempt++) {
+              try {
+                await amo.patch(`/tasks/${task.id}`, { is_completed: true, result: { text: 'Лид уже не в Недозвоне' } });
+                break;
+              } catch (e) {
+                if (attempt < 5) await new Promise(r => setTimeout(r, 2000 * attempt));
+              }
+            }
+          }
+          continue;
+        }
+
         // Фиксируем текущего ответственного в историю до перераспределения
         if (!historyMap.get(lead.id)?.has(responsibleId)) {
           await writeAssignment(lead.id, responsibleId, fromUser.name, 'from');
