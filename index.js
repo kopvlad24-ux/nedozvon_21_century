@@ -1050,6 +1050,64 @@ app.get('/api/preview', async (req, res) => {
   }
 });
 
+// Одноразовый ретроактивный фикс: восстановить 'from' историю из лога
+app.post('/api/fix-history', async (req, res) => {
+  try {
+    const sheets = getSheetsClient();
+
+    // Все сотрудники name→id
+    const empRes = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: 'сотрудники!A2:B200' });
+    const nameToId = new Map();
+    for (const row of (empRes.data.values || [])) {
+      if (row[0] && row[1]) nameToId.set(row[1], parseInt(row[0]));
+    }
+
+    // Текущие assignments
+    const aRes = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: 'assignments!A2:D10000' });
+    const existing = new Map(); // leadId → Set<userId>
+    for (const row of (aRes.data.values || [])) {
+      if (!row[0]) continue;
+      const lid = parseInt(row[0]);
+      const uid = parseInt(row[1]);
+      if (!existing.has(lid)) existing.set(lid, new Set());
+      existing.get(lid).add(uid);
+    }
+
+    // Читаем лог и собираем пропущенные 'from'
+    const logRes = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: 'log!A2:F10000' });
+    const ts = Math.floor(Date.now() / 1000);
+    const toWrite = [];
+    const seen = new Map(); // чтобы не дублировать в рамках этого запроса
+
+    for (const row of (logRes.data.values || [])) {
+      const fromName = row[3];
+      if (!fromName || fromName === '~ Архив') continue;
+      let lid;
+      try { lid = parseInt(row[1]); } catch { continue; }
+      const uid = nameToId.get(fromName);
+      if (!uid) continue;
+      const key = `${lid}_${uid}`;
+      if (existing.get(lid)?.has(uid) || seen.has(key)) continue;
+      seen.set(key, true);
+      if (!existing.has(lid)) existing.set(lid, new Set());
+      existing.get(lid).add(uid);
+      toWrite.push([lid, uid, ts, 'from']);
+    }
+
+    if (toWrite.length > 0) {
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: SHEET_ID, range: 'assignments!A:D',
+        valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS',
+        requestBody: { values: toWrite }
+      });
+    }
+
+    res.json({ success: true, added: toWrite.length, message: `Добавлено ${toWrite.length} записей в историю` });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.post('/api/update-stats', async (req, res) => {
   try {
     await updateStats();
