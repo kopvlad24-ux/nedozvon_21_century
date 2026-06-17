@@ -25,7 +25,7 @@ const STAGE_NEW = 82141386;
 const STAGE_ARCHIVE = 143;
 const STAGE_VZAT_V_RABOTU = 82141394;
 const GROUP_ID = 689470;
-const ANTON_ID = process.env.ANTON_ID ? parseInt(process.env.ANTON_ID) : null;
+const ANTON_ID = process.env.ANTON_ID ? parseInt(process.env.ANTON_ID) : 9083402; // Ермолаев Антон
 const PARKING_DAYS = 4;
 // AmoCRM ID сотрудника (РОП), на которого ставится задача «Назначить агента» как сигнал боту
 const TRANSFER_RECIPIENT_ID = process.env.TRANSFER_RECIPIENT_ID ? parseInt(process.env.TRANSFER_RECIPIENT_ID) : null;
