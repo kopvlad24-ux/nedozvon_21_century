@@ -23,7 +23,10 @@ const PIPELINE_ID = 10391694;
 const STAGE_NEDOZVON = 82141390;
 const STAGE_NEW = 82141386;
 const STAGE_ARCHIVE = 143;
+const STAGE_VZAT_V_RABOTU = 82141394;
 const GROUP_ID = 689470;
+const ANTON_ID = process.env.ANTON_ID ? parseInt(process.env.ANTON_ID) : null;
+const PARKING_DAYS = 4;
 // AmoCRM ID сотрудника (РОП), на которого ставится задача «Назначить агента» как сигнал боту
 const TRANSFER_RECIPIENT_ID = process.env.TRANSFER_RECIPIENT_ID ? parseInt(process.env.TRANSFER_RECIPIENT_ID) : null;
 // task_type_id задачи «Назначить агента» в AmoCRM (4101302 — из отладки)
@@ -548,6 +551,148 @@ async function createTask(leadId, responsibleUserId, text) {
   console.log(`Задача создана: ${leadId}`);
 }
 
+async function parkLead(lead, fromUser, historyMap) {
+  if (!ANTON_ID) return false;
+  if (DRY_RUN) {
+    console.log(`[DRY_RUN] Паркуем лид ${lead.id} → Антон Ермолаев (${ANTON_ID}), этап → Взят в работу`);
+    return true;
+  }
+  // Записываем fromUser в историю
+  if (!historyMap.get(lead.id)?.has(fromUser.id)) {
+    await writeAssignment(lead.id, fromUser.id, fromUser.name, 'from');
+    if (!historyMap.has(lead.id)) historyMap.set(lead.id, new Set());
+    historyMap.get(lead.id).add(fromUser.id);
+  }
+  // Переназначаем на Антона, этап → Взят в работу
+  await amo.patch(`/leads/${lead.id}`, {
+    responsible_user_id: ANTON_ID,
+    status_id: STAGE_VZAT_V_RABOTU,
+    pipeline_id: PIPELINE_ID
+  });
+  // Переназначаем контакты на Антона
+  try {
+    const { data: leadData } = await amo.get(`/leads/${lead.id}`, { params: { with: 'contacts' } });
+    const contacts = leadData._embedded?.contacts || [];
+    if (contacts.length) {
+      await amo.patch('/contacts', contacts.map(c => ({ id: c.id, responsible_user_id: ANTON_ID })));
+    }
+  } catch (e) {
+    console.warn(`Не удалось переназначить контакты лида ${lead.id} на Антона: ${e.message}`);
+  }
+  // Создаём задачу "Передержка" на Антона с дедлайном +4 дня
+  const dueDate = Math.floor(Date.now() / 1000) + PARKING_DAYS * 86400;
+  await amo.post('/tasks', [{
+    task_type_id: 1,
+    text: 'Передержка',
+    complete_till: dueDate,
+    entity_id: lead.id,
+    entity_type: 'leads',
+    responsible_user_id: ANTON_ID
+  }]);
+  await amo.post('/leads/notes', [{
+    entity_id: lead.id,
+    note_type: 'common',
+    params: { text: `⏸ Лид отправлен на передержку (${PARKING_DAYS} дня) — вернётся в очередь автоматически` }
+  }]);
+  await writeLog(lead.id, lead.name, fromUser.name, 'Антон Ермолаев (передержка)', 'назначить агента');
+  console.log(`Лид ${lead.id}: парковка → Антон Ермолаев на ${PARKING_DAYS} дня`);
+  return true;
+}
+
+async function getOpenParkingTasks() {
+  if (!ANTON_ID) return [];
+  try {
+    const { data } = await amo.get('/tasks', {
+      params: { 'filter[responsible_user_id]': ANTON_ID, 'filter[is_completed]': 0, limit: 250 }
+    });
+    const tasks = data._embedded?.tasks || [];
+    return tasks.filter(t => t.text === 'Передержка' && t.entity_type === 'leads');
+  } catch (e) {
+    console.warn('Не удалось получить задачи "Передержка":', e.message);
+    return [];
+  }
+}
+
+let checkParkingRunning = false;
+
+async function checkParkingTasks() {
+  if (!ANTON_ID) return;
+  if (checkParkingRunning) {
+    console.log('checkParkingTasks уже выполняется — пропуск');
+    return;
+  }
+  checkParkingRunning = true;
+  try {
+    await _checkParkingTasks();
+  } finally {
+    checkParkingRunning = false;
+  }
+}
+
+async function _checkParkingTasks() {
+  const moscowHour = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' })).getHours();
+  if (moscowHour >= 20 || moscowHour < 10) return;
+  console.log(`\n=== Проверка передержки ${new Date().toISOString()} ===`);
+  try {
+    const { distribute } = await getQueueData();
+    if (!distribute.length) return;
+    const [assignments, lastAssignedId] = await Promise.all([getAssignmentsMap(), getLastAssignedId()]);
+    const { countMap, historyMap } = assignments;
+    await seedHistoryFromAllPipelineLeads(historyMap);
+    let currentLastAssignedId = lastAssignedId;
+    const nowTs = Math.floor(Date.now() / 1000);
+    const parkingTasks = await getOpenParkingTasks();
+    const dueTasks = parkingTasks.filter(t => t.complete_till <= nowTs);
+    if (!dueTasks.length) {
+      console.log(`Передержка: ${parkingTasks.length} активных, просроченных нет`);
+      return;
+    }
+    console.log(`Передержка: ${dueTasks.length} просроченных → перераспределяем`);
+    const antonUser = { id: ANTON_ID, name: 'Антон Ермолаев' };
+    let statsUpdated = false;
+    for (const task of dueTasks) {
+      try {
+        const { data: lead } = await amo.get(`/leads/${task.entity_id}`);
+        if (lead.pipeline_id !== PIPELINE_ID) {
+          console.log(`Задача передержки ${task.id}: лид ${task.entity_id} не в нашей воронке — закрываем`);
+          if (!DRY_RUN) await amo.patch(`/tasks/${task.id}`, { is_completed: true, result: { text: 'Лид не в воронке' } }).catch(() => {});
+          continue;
+        }
+        console.log(`Лид ${lead.id}: передержка завершена → перераспределяем`);
+        let redistributed = false;
+        try {
+          const result = await performRedistribution(lead, antonUser, distribute, countMap, currentLastAssignedId, historyMap, 'передержка');
+          redistributed = true;
+          if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
+          statsUpdated = true;
+        } catch (e) {
+          console.warn(`Лид ${lead.id}: ошибка перераспределения после передержки: ${e.message}`);
+        }
+        if (redistributed && !DRY_RUN) {
+          let closed = false;
+          for (let attempt = 1; attempt <= 5; attempt++) {
+            try {
+              await amo.patch(`/tasks/${task.id}`, { is_completed: true, result: { text: 'Передержка завершена, лид перераспределён' } });
+              console.log(`Задача передержки ${task.id} закрыта`);
+              closed = true;
+              break;
+            } catch (e) {
+              console.warn(`Попытка ${attempt}/5 закрыть задачу ${task.id}: ${e.message}`);
+              if (attempt < 5) await new Promise(r => setTimeout(r, 2000 * attempt));
+            }
+          }
+          if (!closed) console.error(`Задача ${task.id}: не удалось закрыть за 5 попыток`);
+        }
+      } catch (e) {
+        console.warn(`Ошибка задачи передержки ${task.id}: ${e.message}`, e.response?.data);
+      }
+    }
+    if (statsUpdated) await updateStats();
+  } catch (err) {
+    console.error('Ошибка _checkParkingTasks:', err.message);
+  }
+}
+
 async function reassignAndMove(lead, fromUser, nextUser, reason = '') {
   if (DRY_RUN) {
     console.log(`[DRY_RUN] Сделка ${lead.id} → ${nextUser.name}, этап → Новая заявка [${reason}]`);
@@ -558,7 +703,7 @@ async function reassignAndMove(lead, fromUser, nextUser, reason = '') {
   // - всегда при "Назначить агента" (брокер явно решил передать, вне зависимости от этапа)
   // - при авто-5-дней только если лид в Недозвоне
   const patchData = { responsible_user_id: nextUser.id };
-  if (lead.status_id === STAGE_NEDOZVON || reason === 'назначить агента') {
+  if (lead.status_id === STAGE_NEDOZVON || reason === 'назначить агента' || reason === 'передержка') {
     patchData.status_id = STAGE_NEW;
     patchData.pipeline_id = PIPELINE_ID;
   }
@@ -846,15 +991,26 @@ async function _checkTransferTasks() {
           if (!historyMap.has(lead.id)) historyMap.set(lead.id, new Set());
           historyMap.get(lead.id).add(responsibleId);
         }
-        console.log(`Сделка ${lead.id} (${lead.name}): задача "Назначить агента" → немедленное переназначение`);
+        console.log(`Сделка ${lead.id} (${lead.name}): задача "Назначить агента" → ${ANTON_ID ? 'передержка' : 'немедленное переназначение'}`);
         let redistributed = false;
-        try {
-          const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId, historyMap, 'назначить агента');
-          redistributed = true; // успешно: либо передан агенту, либо отправлен в архив
-          if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
-        } catch (e) {
-          console.warn(`Сделка ${lead.id}: ошибка переназначения: ${e.message}`);
-          if (e.response?.data) console.warn('Детали:', JSON.stringify(e.response.data));
+        if (ANTON_ID) {
+          // Паркуем лид к Антону на PARKING_DAYS дней
+          try {
+            const parked = await parkLead(lead, fromUser, historyMap);
+            if (parked) redistributed = true;
+          } catch (e) {
+            console.warn(`Сделка ${lead.id}: ошибка парковки: ${e.message}`);
+            if (e.response?.data) console.warn('Детали:', JSON.stringify(e.response.data));
+          }
+        } else {
+          try {
+            const result = await performRedistribution(lead, fromUser, distribute, countMap, currentLastAssignedId, historyMap, 'назначить агента');
+            redistributed = true;
+            if (result.newLastAssignedId) currentLastAssignedId = result.newLastAssignedId;
+          } catch (e) {
+            console.warn(`Сделка ${lead.id}: ошибка переназначения: ${e.message}`);
+            if (e.response?.data) console.warn('Детали:', JSON.stringify(e.response.data));
+          }
         }
         // Закрываем задачу ТОЛЬКО если переназначение прошло успешно (retry при socket hang up)
         if (redistributed && !DRY_RUN) {
@@ -894,6 +1050,9 @@ cron.schedule('0 15 * * 1-5', checkLeads, { timezone: 'Europe/Moscow' });
 
 // каждые 5 минут — молниеносная передача по задаче "Назначить агента"
 cron.schedule('*/5 * * * *', checkTransferTasks);
+
+// каждые 5 минут — проверяем просроченные задачи передержки у Антона
+cron.schedule('*/5 * * * *', checkParkingTasks);
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
@@ -1091,6 +1250,28 @@ app.post('/api/fix-history', async (req, res) => {
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
+});
+
+// Временный эндпоинт для поиска ID сотрудников в amoCRM
+app.get('/api/list-all-users', async (req, res) => {
+  try {
+    const { data } = await amo.get('/users', { params: { limit: 250 } });
+    const users = (data._embedded?.users || []).map(u => ({
+      id: u.id,
+      name: u.name,
+      email: u.email,
+      group_id: u.rights?.group_id,
+      is_active: u.rights?.is_active
+    }));
+    res.json({ total: users.length, users });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/check-parking', (req, res) => {
+  checkParkingTasks();
+  res.json({ success: true, message: 'Проверка передержки запущена', anton_id: ANTON_ID });
 });
 
 app.post('/api/update-stats', async (req, res) => {
