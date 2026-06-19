@@ -369,23 +369,53 @@ async function archiveLead(lead) {
 function pickNextUser(distribute, lastAssignedId, currentResponsibleId, leadHistory) {
   if (!distribute.length) throw new Error('Список выдачи пуст');
   const lastIdx = distribute.findIndex(u => u.id === lastAssignedId);
-  // Первый проход: ищем того кто не был ответственным за этот лид и не текущий
+  // Ищем только того, кто ещё не был ответственным за этот лид и не текущий.
+  // Повтор по истории запрещён: если кандидатов нет, лид должен уйти в архив.
   for (let i = 1; i <= distribute.length; i++) {
     const candidate = distribute[(lastIdx + i) % distribute.length];
     if (candidate.id === currentResponsibleId) continue;
     if (leadHistory && leadHistory.has(candidate.id)) continue;
     return candidate;
   }
-  // Второй проход: все уже были — просто пропускаем текущего ответственного
-  for (let i = 1; i <= distribute.length; i++) {
-    const candidate = distribute[(lastIdx + i) % distribute.length];
-    if (candidate.id !== currentResponsibleId) return candidate;
-  }
-  return distribute[0];
+  return null;
 }
 
 
 // ─── История ответственных по сделке из AMO ───────────────────────────────────
+
+async function getLeadResponsibleHistory(leadId) {
+  const history = new Set();
+  let page = 1;
+
+  while (true) {
+    try {
+      const { data } = await amo.get('/events', {
+        params: {
+          'filter[entity]': 'lead',
+          'filter[entity_id]': leadId,
+          limit: 250,
+          page
+        }
+      });
+      const events = data._embedded?.events || [];
+      for (const event of events) {
+        if (event.type !== 'entity_responsible_changed') continue;
+        const beforeId = event.value_before?.[0]?.responsible_user?.id;
+        const afterId = event.value_after?.[0]?.responsible_user?.id;
+        if (beforeId) history.add(beforeId);
+        if (afterId) history.add(afterId);
+      }
+      if (events.length < 250) break;
+      page++;
+    } catch (e) {
+      console.warn(`Не удалось получить историю ответственных для ${leadId}: ${e.message}`);
+      if (e.response?.data) console.warn('AMO ответ:', JSON.stringify(e.response.data));
+      break;
+    }
+  }
+
+  return history;
+}
 
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -789,9 +819,10 @@ async function performRedistribution(lead, fromUser, distribute, countMap, lastA
     return { newLastAssignedId: null };
   }
 
-  // Используем историю из Google Sheets — AMO Events API не поддерживает нужный фильтр
+  // Объединяем нашу историю из Google Sheets и фактическую историю ответственных из AmoCRM.
   const sheetHistory = historyMap?.get(lead.id) || new Set();
-  const history = new Set([...sheetHistory]);
+  const amoHistory = await getLeadResponsibleHistory(lead.id);
+  const history = new Set([...sheetHistory, ...amoHistory]);
   history.add(fromUser.id);
   console.log(`Сделка ${lead.id}: история ответственных (${history.size}): [${[...history].join(', ')}]`);
   let candidates = distribute.filter(u => !history.has(u.id));
@@ -805,10 +836,14 @@ async function performRedistribution(lead, fromUser, distribute, countMap, lastA
 
   // Перебираем кандидатов — пропускаем тех, кого AmoCRM не принимает (нет доступа к воронке)
   while (candidates.length > 0) {
-    const nextUser = pickNextUser(candidates, lastAssignedId, fromUser.id, null);
+    const nextUser = pickNextUser(candidates, lastAssignedId, fromUser.id, history);
+    if (!nextUser) break;
     try {
       await reassignAndMove(lead, fromUser, nextUser, reason);
       await setLastAssignedId(nextUser.id);
+      if (!historyMap.has(lead.id)) historyMap.set(lead.id, new Set());
+      historyMap.get(lead.id).add(nextUser.id);
+      countMap.set(lead.id, (countMap.get(lead.id) || 0) + 1);
       return { newLastAssignedId: nextUser.id };
     } catch (e) {
       const errors = e.response?.data?.['validation-errors']?.[0]?.errors || [];
@@ -1112,6 +1147,38 @@ app.get('/api/debug-tasks/:leadId', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/debug-lead-history/:leadId', async (req, res) => {
+  try {
+    const leadId = parseInt(req.params.leadId);
+    const [{ data: lead }, assignments, queueData] = await Promise.all([
+      amo.get(`/leads/${leadId}`),
+      getAssignmentsMap(),
+      getQueueData()
+    ]);
+    const amoHistory = await getLeadResponsibleHistory(leadId);
+    const sheetHistory = assignments.historyMap.get(leadId) || new Set();
+    const names = new Map(queueData.allQueueUsers.map(u => [u.id, u.name]));
+    const toPeople = ids => [...ids].map(id => ({ id, name: names.get(id) || `User ${id}` }));
+
+    res.json({
+      lead: {
+        id: lead.id,
+        name: lead.name,
+        responsible_user_id: lead.responsible_user_id,
+        responsible_name: names.get(lead.responsible_user_id) || `User ${lead.responsible_user_id}`,
+        pipeline_id: lead.pipeline_id,
+        status_id: lead.status_id
+      },
+      sheetHistory: toPeople(sheetHistory),
+      amoHistory: toPeople(amoHistory),
+      combinedHistory: toPeople(new Set([...sheetHistory, ...amoHistory, lead.responsible_user_id])),
+      redistributionCount: assignments.countMap.get(leadId) || 0
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, details: err.response?.data || null });
   }
 });
 
