@@ -26,7 +26,7 @@ const STAGE_ARCHIVE = 143;
 const STAGE_VZAT_V_RABOTU = 82141394;
 const GROUP_ID = 689470;
 const ANTON_ID = process.env.ANTON_ID ? parseInt(process.env.ANTON_ID) : 9083402; // Ермолаев Антон
-const PARKING_DAYS = 4;
+const PARKING_DAYS = 3;
 // AmoCRM ID сотрудника (РОП), на которого ставится задача «Назначить агента» как сигнал боту
 const TRANSFER_RECIPIENT_ID = process.env.TRANSFER_RECIPIENT_ID ? parseInt(process.env.TRANSFER_RECIPIENT_ID) : null;
 // task_type_id задачи «Назначить агента» в AmoCRM (4101302 — из отладки)
@@ -609,7 +609,7 @@ async function parkLead(lead, fromUser, historyMap) {
   } catch (e) {
     console.warn(`Не удалось переназначить контакты лида ${lead.id} на Антона: ${e.message}`);
   }
-  // Создаём задачу "Передержка" на Антона с дедлайном +4 дня
+  // Создаём задачу "Передержка" на Антона с дедлайном +3 дня
   const dueDate = Math.floor(Date.now() / 1000) + PARKING_DAYS * 86400;
   await amo.post('/tasks', [{
     task_type_id: 1,
