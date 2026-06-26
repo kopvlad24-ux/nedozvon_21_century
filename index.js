@@ -624,7 +624,7 @@ async function parkLead(lead, fromUser, historyMap) {
     note_type: 'common',
     params: { text: `⏸ Лид отправлен на передержку (${PARKING_DAYS} дня) — вернётся в очередь автоматически` }
   }]);
-  await writeLog(lead.id, lead.name, fromUser.name, 'Антон Ермолаев (передержка)', 'назначить агента');
+  await writeLog(lead.id, lead.name, fromUser.name, 'Антон Ермолаев', 'передержка');
   console.log(`Лид ${lead.id}: парковка → Антон Ермолаев на ${PARKING_DAYS} дня`);
   return true;
 }
@@ -1018,7 +1018,7 @@ async function _checkTransferTasks() {
           continue;
         }
         const responsibleId = lead.responsible_user_id;
-        const fromUser = { id: responsibleId, name: userNameMap.get(responsibleId) || `User ${responsibleId}` };
+        const fromUser = { id: responsibleId, name: userNameMap.get(responsibleId) || (responsibleId === ANTON_ID ? 'Антон Ермолаев' : `User ${responsibleId}`) };
 
         // Фиксируем текущего ответственного в историю до перераспределения
         if (!historyMap.get(lead.id)?.has(responsibleId)) {
