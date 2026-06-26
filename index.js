@@ -1351,7 +1351,7 @@ app.post('/api/fix-parking-log', async (req, res) => {
     const updated = rows.map(row => {
       const newRow = [...row];
       // Колонка E (index 4) = toName, колонка F (index 5) = reason
-      if (row[4] === 'Антон Ермолаев (передержка)') {
+      if (row[4] && row[4].includes('Ермолаев') && row[4].includes('передержка')) {
         newRow[4] = 'Антон Ермолаев';
         newRow[5] = 'передержка';
         fixed++;
