@@ -1341,6 +1341,36 @@ app.post('/api/check-parking', (req, res) => {
   res.json({ success: true, message: 'Проверка передержки запущена', anton_id: ANTON_ID });
 });
 
+// Одноразовый фикс: заменить "Антон Ермолаев (передержка)" → "Антон Ермолаев" + reason → 'передержка'
+app.post('/api/fix-parking-log', async (req, res) => {
+  try {
+    const sheets = getSheetsClient();
+    const logRes = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: 'log!A2:F10000' });
+    const rows = logRes.data.values || [];
+    let fixed = 0;
+    const updated = rows.map(row => {
+      const newRow = [...row];
+      // Колонка E (index 4) = toName, колонка F (index 5) = reason
+      if (row[4] === 'Антон Ермолаев (передержка)') {
+        newRow[4] = 'Антон Ермолаев';
+        newRow[5] = 'передержка';
+        fixed++;
+      }
+      return newRow;
+    });
+    if (fixed > 0) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID, range: 'log!A2',
+        valueInputOption: 'RAW', requestBody: { values: updated }
+      });
+      await updateStats();
+    }
+    res.json({ success: true, fixed, message: `Исправлено ${fixed} записей парковки в логе` });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/update-stats', async (req, res) => {
   try {
     await updateStats();
