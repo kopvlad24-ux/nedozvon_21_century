@@ -1341,17 +1341,6 @@ app.post('/api/check-parking', (req, res) => {
   res.json({ success: true, message: 'Проверка передержки запущена', anton_id: ANTON_ID });
 });
 
-app.get('/api/debug-log-tail', async (req, res) => {
-  try {
-    const sheets = getSheetsClient();
-    const logRes = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: 'log!A2:F10000' });
-    const rows = logRes.data.values || [];
-    const tail = rows.slice(-10).map(r => ({ len: r.length, cols: r }));
-    const antonRows = rows.filter(r => r[4] && r[4].toString().includes('Ермолаев'));
-    res.json({ totalRows: rows.length, tail, antonCount: antonRows.length, antonSample: antonRows.slice(0, 3) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 // Одноразовый фикс: заменить "Антон Ермолаев (передержка)" → "Антон Ермолаев" + reason → 'передержка'
 app.post('/api/fix-parking-log', async (req, res) => {
   try {
