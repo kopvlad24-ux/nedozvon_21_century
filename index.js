@@ -1341,6 +1341,31 @@ app.post('/api/check-parking', (req, res) => {
   res.json({ success: true, message: 'Проверка передержки запущена', anton_id: ANTON_ID });
 });
 
+// Временный: статистика по лидам в воронке
+app.get('/api/pipeline-stats', async (req, res) => {
+  try {
+    const stageCounts = {};
+    const responsibleCounts = {};
+    let total = 0;
+    let page = 1;
+    while (true) {
+      const { data } = await amo.get('/leads', {
+        params: { 'filter[pipeline_id]': PIPELINE_ID, limit: 250, page, with: 'contacts' }
+      });
+      const batch = data._embedded?.leads || [];
+      for (const lead of batch) {
+        total++;
+        stageCounts[lead.status_id] = (stageCounts[lead.status_id] || 0) + 1;
+        const uid = lead.responsible_user_id;
+        if (uid) responsibleCounts[uid] = (responsibleCounts[uid] || 0) + 1;
+      }
+      if (batch.length < 250) break;
+      page++;
+    }
+    res.json({ total, stageCounts, responsibleCounts });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Одноразовый фикс: заменить "Антон Ермолаев (передержка)" → "Антон Ермолаев" + reason → 'передержка'
 app.post('/api/fix-parking-log', async (req, res) => {
   try {
